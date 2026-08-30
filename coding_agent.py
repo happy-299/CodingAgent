@@ -24,6 +24,17 @@ class AgentError(Exception):
     """A user-facing agent error."""
 
 
+def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = os.getenv(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise AgentError(f"{name} must be an integer, got {raw!r}.") from exc
+    if not minimum <= value <= maximum:
+        raise AgentError(f"{name} must be between {minimum} and {maximum}, got {value}.")
+    return value
+
+
 def load_dotenv(path: Path) -> None:
     """Load a small, conventional subset of dotenv without another dependency."""
     if not path.is_file():
@@ -47,6 +58,7 @@ class Config:
     timeout: int = 180
     max_rounds: int = 20
     max_history_chars: int = 300_000
+    max_output_tokens: int = 32_768
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -57,9 +69,10 @@ class Config:
             api_key=api_key,
             base_url=os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com").rstrip("/"),
             model=os.getenv("OPENAI_MODEL", "deepseek-v4-flash"),
-            timeout=int(os.getenv("AGENT_API_TIMEOUT", "180")),
-            max_rounds=int(os.getenv("AGENT_MAX_ROUNDS", "20")),
-            max_history_chars=int(os.getenv("AGENT_MAX_HISTORY_CHARS", "300000")),
+            timeout=_env_int("AGENT_API_TIMEOUT", 180, 1, 600),
+            max_rounds=_env_int("AGENT_MAX_ROUNDS", 20, 1, 100),
+            max_history_chars=_env_int("AGENT_MAX_HISTORY_CHARS", 300_000, 10_000, 10_000_000),
+            max_output_tokens=_env_int("AGENT_MAX_OUTPUT_TOKENS", 32_768, 1_024, 384_000),
         )
 
 
@@ -76,14 +89,14 @@ class TerminalTool:
     def __init__(self, root: Path):
         self.root = root.resolve()
 
-    def run(self, command: str, timeout: int = 60) -> str:
+    def run(self, command: str, timeout: int = 60) -> dict[str, Any]:
         if not command.strip():
             raise AgentError("Command cannot be empty.")
         timeout = max(1, min(int(timeout), 300))
         argv = (
             ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command]
             if os.name == "nt"
-            else ["/bin/bash", "-lc", command]
+            else ["/bin/bash", "-o", "pipefail", "-lc", command]
         )
         sensitive = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
         child_env = {
@@ -120,8 +133,13 @@ class TerminalTool:
                 os.killpg(process.pid, signal.SIGKILL)
             output, _ = process.communicate()
             raise AgentError(f"Command timed out after {timeout}s.\n{_clip(output or '')}") from exc
-        output = _clip(output)
-        return f"exit_code={process.returncode}\n{output or '<no output>'}"
+        output = output or ""
+        return {
+            "exit_code": process.returncode,
+            "output": _clip(output) if output else "<no output>",
+            "output_chars": len(output),
+            "truncated": len(output) > MAX_TOOL_OUTPUT,
+        }
 
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [{
@@ -131,7 +149,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [{
         "description": (
             "Run one shell command in the workspace and return combined stdout/stderr plus its exit code. "
             "Use standard CLI programs to inspect, search, read, edit, create, delete, build, and test files. "
-            "The shell is bash on Linux/macOS and PowerShell on Windows."
+            "The shell is bash with pipefail enabled on Linux/macOS and PowerShell on Windows."
         ),
         "parameters": {
             "type": "object",
@@ -158,7 +176,7 @@ class DeepSeekClient:
             "tool_choice": "auto",
             "thinking": {"type": "enabled"},
             "reasoning_effort": "high",
-            "max_tokens": 8192,
+            "max_tokens": self.config.max_output_tokens,
         }
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
@@ -170,8 +188,12 @@ class DeepSeekClient:
         for attempt in range(4):
             try:
                 with urllib.request.urlopen(request, timeout=self.config.timeout) as response:
-                    data = json.loads(response.read().decode("utf-8"))
-                if not data.get("choices"):
+                    raw_response = response.read().decode("utf-8")
+                try:
+                    data = json.loads(raw_response)
+                except json.JSONDecodeError as exc:
+                    raise AgentError("API returned invalid JSON.") from exc
+                if not isinstance(data, dict) or not isinstance(data.get("choices"), list) or not data["choices"]:
                     raise AgentError("Model returned no choices.")
                 return data
             except urllib.error.HTTPError as exc:
@@ -192,8 +214,12 @@ SYSTEM_PROMPT = """You are a careful coding agent operating in a local workspace
 Use the terminal tool and standard command-line programs to inspect the project, edit files, and run relevant checks. The terminal starts in the workspace, but it is not an OS sandbox: keep every operation inside the workspace unless the user explicitly asks otherwise. Never inspect or print credentials, .env files, private keys, or secret environment variables. Do not claim a change or test succeeded unless terminal output confirms it. Read existing files before editing them. Keep changes focused and preserve unrelated work. When a command fails, diagnose its output and recover if possible. Once the task is genuinely complete, respond with a concise summary and tests run."""
 
 
+def print_event(message: str) -> None:
+    print(message, flush=True)
+
+
 class CodingAgent:
-    def __init__(self, client: Any, workspace: Path, config: Config, on_event: Callable[[str], None] = print):
+    def __init__(self, client: Any, workspace: Path, config: Config, on_event: Callable[[str], None] = print_event):
         self.client = client
         self.config = config
         self.terminal = TerminalTool(workspace)
@@ -234,10 +260,21 @@ class CodingAgent:
     def run(self, user_text: str) -> str:
         self.messages.append({"role": "user", "content": user_text})
         self._trim_history()
+        tool_call_count = 0
+        input_tokens = 0
+        output_tokens = 0
         for round_number in range(1, self.config.max_rounds + 1):
             response = self.client.complete(self.messages, TOOL_SCHEMAS)
-            choice = response["choices"][0]
-            message = choice.get("message") or {}
+            usage = response.get("usage") or {}
+            input_tokens += int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
+            output_tokens += int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
+            choices = response.get("choices")
+            if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+                raise AgentError("Model response has an invalid choices field.")
+            choice = choices[0]
+            message = choice.get("message")
+            if not isinstance(message, dict):
+                raise AgentError("Model response is missing an assistant message.")
             assistant: dict[str, Any] = {"role": "assistant", "content": message.get("content")}
             if message.get("reasoning_content") is not None:
                 assistant["reasoning_content"] = message["reasoning_content"]
@@ -246,13 +283,35 @@ class CodingAgent:
             self.messages.append(assistant)
 
             calls = message.get("tool_calls") or []
+            if not isinstance(calls, list):
+                raise AgentError("Model response has an invalid tool_calls field.")
             if not calls:
                 finish = choice.get("finish_reason")
                 if finish == "length":
-                    raise AgentError("Model output hit its token limit before completing the task.")
+                    self.on_event(f"[round {round_number}] output limit reached; asking model to continue")
+                    self.messages.append({
+                        "role": "user",
+                        "content": (
+                            "Continue the same task from where you stopped. The previous response reached its "
+                            "output limit, so do not restart or repeat completed exploration. Use the terminal "
+                            "to finish the implementation and verification, then provide the final answer."
+                        ),
+                    })
+                    continue
+                if finish not in {None, "stop"}:
+                    raise AgentError(f"Model stopped without completing the task: {finish}.")
+                if not isinstance(message.get("content"), str) or not message["content"].strip():
+                    raise AgentError("Model stopped without returning final text.")
+                self.on_event(
+                    f"[done] rounds={round_number} tool_calls={tool_call_count} "
+                    f"tokens={input_tokens}in/{output_tokens}out"
+                )
                 return message.get("content") or "<model returned no final text>"
 
             for call_number, call in enumerate(calls, 1):
+                if not isinstance(call, dict) or not isinstance(call.get("id"), str) or not call["id"]:
+                    raise AgentError("Model returned a tool call without a valid id.")
+                tool_call_count += 1
                 name = (call.get("function") or {}).get("name", "unknown")
                 raw_arguments = (call.get("function") or {}).get("arguments", "")
                 try:
@@ -266,9 +325,14 @@ class CodingAgent:
                 self.on_event(label + (f": {preview}" if preview else ""))
                 result = self._execute(call)
                 parsed = json.loads(result)
-                status = "ok" if parsed["ok"] else f"error: {parsed['error']}"
+                terminal_result = parsed.get("result") or {}
+                if parsed["ok"] and isinstance(terminal_result, dict):
+                    suffix = " truncated" if terminal_result.get("truncated") else ""
+                    status = f"exit={terminal_result.get('exit_code')} output={terminal_result.get('output_chars')} chars{suffix}"
+                else:
+                    status = "ok" if parsed["ok"] else f"error: {parsed['error']}"
                 self.on_event(f"  -> {status}")
-                self.messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": result})
+                self.messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
         raise AgentError(f"Agent stopped after {self.config.max_rounds} tool rounds without a final answer.")
 
 
@@ -283,6 +347,9 @@ def main() -> int:
     args = build_parser().parse_args()
     launch_directory = Path.cwd().resolve()
     workspace = Path(args.workspace).resolve()
+    if not workspace.is_dir():
+        print(f"error: workspace is not a directory: {workspace}", file=sys.stderr)
+        return 1
     load_dotenv(launch_directory / ".env")
     if workspace != launch_directory:
         load_dotenv(workspace / ".env")
