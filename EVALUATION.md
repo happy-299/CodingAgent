@@ -1,20 +1,68 @@
-# End-to-end evaluation
+# 端到端评测记录
 
-The agent was exercised against an isolated Python Todo CLI project using the real `deepseek-v4-flash` API, not a scripted model.
+评测使用 `.env` 中的真实 `deepseek-v4-flash`，不是脚本化假模型。评测项目位于 Git 忽略的隔离目录，agent 只能看到工作区内的需求、残缺实现和可见测试；隐藏测试由外部独立执行。
 
-## Initial implementation
+## 项目难度
 
-Given only a requirements file and tests, the agent inspected the workspace, created the implementation, ran the tests, and performed extra edge-case checks. It completed after 9 tool rounds. Independent verification passed all 3 tests covering persistence, unknown IDs, and malformed JSON.
+任务是修复一个多模块 Python Task API，仅允许使用标准库。它同时要求：
 
-## Incremental change
+- `TaskStore` 的 JSON 持久化、严格结构校验、单调且不复用的 ID；
+- 多线程创建与更新不丢数据，写临时文件、`fsync`、原子替换及目录同步；
+- `ThreadingHTTPServer` 的健康检查、任务创建/筛选/更新；
+- Content-Type、Content-Length、JSON 结构、路径和查询参数的严格验证；
+- 400/404/415/500 错误映射，500 不泄露内部异常；
+- 可见测试之外的并发、损坏数据和协议边界测试。
 
-A `stats` command and a failing test were then added. Starting from the existing code, the agent:
+初始基线为 4 项可见测试全部失败：3 个 failure、1 个 error。
 
-1. inspected the requirements, implementation, and tests;
-2. ran the suite and reproduced the failure;
-3. made a focused edit through the terminal;
-4. reran the full suite and checked empty/corrupt database behavior.
+## 第一轮：发现循环终止缺陷
 
-It completed after 5 tool rounds. Independent verification passed all 4 tests. This second run also verified that `--workspace` loads credentials from the launch directory and that multiple terminal calls in one model response are handled correctly.
+模型完成项目探索并运行基线测试后，响应达到 8192 输出 token 上限。旧循环看到 `finish_reason=length` 便直接报错，任务在第 4 轮终止，尚未开始修改代码。
 
-The disposable evaluation fixture lived under ignored `tmp/` and is not part of the submitted implementation.
+这说明复杂任务不能把“输出达到上限”误判为“任务失败”。对应改进：
+
+1. 增加 `AGENT_MAX_OUTPUT_TOKENS`，默认 32768；
+2. 达到输出上限时保留 assistant 内容与 `reasoning_content`；
+3. 自动追加继续指令，在原有最大轮数预算内恢复，不重复已完成探索；
+4. 增加脚本化回归测试验证续写后仍可调用 terminal 并正常结束。
+
+## 第二轮：完整修复与隐藏验收
+
+相同基线重新运行后，agent 用 9 次 terminal 调用完成：读取需求与多模块代码、复现测试、重写存储层和 HTTP 层、运行可见测试，并主动构造额外并发与协议检查。
+
+独立结果：
+
+| 测试 | 结果 |
+|---|---|
+| 可见功能测试 | 4/4 通过 |
+| 隐藏并发与原子写入 | 通过（12 workers、60 次创建、ID 1..60、JSON 完整） |
+| 隐藏结构与类型校验 | 通过 |
+| 隐藏 HTTP 严格协议 | 通过 |
+
+隐藏测试总计 3/3 通过。没有出现 terminal 无法表达的操作，因此没有增加文件读写或搜索工具。
+
+本轮观察到事件日志在非交互管道中延迟显示，且 terminal 把“工具执行成功”统一显示为 `ok`，无法直观看到命令本身的非零退出码。对应改进：事件强制刷新；terminal 返回结构化的 `exit_code`、`output`、`output_chars`、`truncated`；完成时汇总轮次、工具调用与 token 使用。
+
+## 第三轮：已有项目上的增量需求
+
+在已通过并发与原子性测试的实现上增加：
+
+- `TaskStore.delete(id)`，删除后 ID 永不复用；
+- `DELETE /tasks/{id}`，成功返回 204、空 body、`Content-Length: 0`；
+- 非法路径 400、不存在任务 404、存储异常 500。
+
+基线新增测试为 1 failure、1 error。agent 没有推倒重写，而是复用锁与原子保存路径，对两个模块做局部修改。最终统计：13 轮、13 次 terminal 调用、106475 input tokens、4879 output tokens。
+
+独立结果：可见测试 6/6、原隐藏测试 3/3 全部通过；额外验证了并发删除、重启持久化、ID 不复用、204 响应和错误路径。
+
+本轮还发现模型常用 `python ... | tail` 压缩测试输出，而 Bash 默认可能用 `tail` 的 0 覆盖上游测试失败。terminal 因此在 POSIX 下启用 `pipefail`，并新增回归测试确保管道上游失败能够传播。
+
+## 最终回归
+
+- 框架单元测试：15/15 通过；
+- 高难度项目可见测试：6/6 通过；
+- 高难度项目隐藏测试：3/3 通过；
+- Python 编译检查通过；
+- `.env` 仍由 `.gitignore` 排除。
+
+评测表明，工具数量不是当前瓶颈。真正影响任务完成率的是输出上限恢复、可靠的 shell 退出语义、结构化观察结果、实时可见性和明确的循环边界。这些能力均可在保留单一 terminal 的前提下完善。

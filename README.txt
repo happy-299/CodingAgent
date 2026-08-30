@@ -1,8 +1,10 @@
 项目名称：Minimal Coding Agent
-Git 仓库地址：https://github.com/happy-299/CodingAgent
+Git 仓库：https://github.com/happy-299/CodingAgent
 
-运行方法：需要 Python 3.10+。在项目根目录的 .env 中配置 OPENAI_API_KEY、OPENAI_BASE_URL=https://api.deepseek.com、OPENAI_MODEL=deepseek-v4-flash，然后执行 python3 coding_agent.py；也可执行 python3 coding_agent.py "任务描述" 运行一次性任务。运行测试：python3 -m unittest discover -v。
+运行：需要 Python 3.10+，无需安装依赖。在 .env 中配置 DeepSeek API Key，执行 python3 coding_agent.py 进入交互模式；也可执行 python3 coding_agent.py --workspace /path/to/project "任务"。测试命令为 python3 -m unittest discover -v。
 
-特色功能：不使用任何 Agent 框架或 SDK，直接调用模型原生 tool calling。智能体自行维护多轮对话、模型推理内容、工具调用和工具结果；只向模型提供一个通用终端，由模型通过标准命令完成目录浏览、代码搜索、读写文件、构建和测试，降低工具选择与提示词开销。模型可反复观察结果、修改代码并验证，直到给出最终答复。
+设计：早期模型需要 list/read/write/search 等窄工具帮助行动；随着大模型的代码、Shell 和长上下文能力增强，这些工具逐渐成为 ls、rg、sed、Python 的重复封装，并增加 schema 占用与选择成本。因此本项目只提供一个可组合的 terminal，让模型直接复用真实开发环境完成探索、编辑、构建和测试。只有终端无法表达、评测持续失败或需要独立授权边界时才新增工具。
 
-可靠性设计：终端从工作区启动且不继承 Key、Token、Secret 等敏感环境变量；工具参数和 JSON 调用均校验；长输出自动截断；命令超时时终止子进程组；API 临时故障自动重试；最大循环数防止失控。上下文按完整用户回合裁剪，不破坏 assistant/tool 消息配对。命令执行并非操作系统沙箱，应只在可信项目中使用。
+实现：项目不使用 Agent 框架、SDK 或托管代码执行，只用标准库直连 DeepSeek 原生 tool calling。自行维护多轮历史、reasoning_content、工具调用与结果；按完整回合裁剪上下文。terminal 返回结构化退出码、输出长度和截断状态，启用 pipefail，不继承敏感环境变量，超时终止进程组。API 支持重试；输出达到 token 上限可保留上下文续写；最大轮数保证终止。
+
+验证：15 项框架测试全部通过。真实 V4 Flash 完成多模块 Task API，覆盖线程安全、原子 JSON 持久化、严格 HTTP 校验及错误映射；最终可见测试 6/6、隐藏并发与协议测试 3/3 通过。评测先后推动了输出上限恢复、实时日志、结构化 terminal 结果和管道失败传播。
