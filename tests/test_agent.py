@@ -522,6 +522,11 @@ class ArchitectureTest(unittest.TestCase):
         for task_name in ("MiniQueue", "2048", "HTTP"):
             self.assertNotIn(task_name, SYSTEM_PROMPT)
 
+    def test_system_prompt_requires_behavioral_interactive_verification(self):
+        self.assertIn("observable state transitions", SYSTEM_PROMPT)
+        self.assertIn("tautological assertions", SYSTEM_PROMPT)
+        self.assertIn("exit code 0 alone", SYSTEM_PROMPT)
+
     def test_plan_requires_unique_steps_and_one_active_item(self):
         plan = PlanState()
         plan.update([
