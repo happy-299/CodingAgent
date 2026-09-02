@@ -664,6 +664,11 @@ class ArchitectureTest(unittest.TestCase):
         self.assertTrue(any("reasoning_compacted" in event for event in events))
 
 
+class FakeTTY(io.StringIO):
+    def isatty(self):
+        return True
+
+
 class TerminalUITest(unittest.TestCase):
     def test_plain_render_contains_all_demo_sections_without_ansi(self):
         stream = io.StringIO()
@@ -692,6 +697,71 @@ class TerminalUITest(unittest.TestCase):
         self.assertIn("THINKING · LIVE", rendered)
         self.assertIn("AGENT · LIVE", rendered)
         self.assertEqual(rendered.count("Finished."), 1)
+
+    def test_tty_dashboard_collapses_reasoning_and_keeps_input_bar_fixed(self):
+        stream = FakeTTY()
+        with patch("coding_agent.shutil.get_terminal_size", return_value=os.terminal_size((80, 20))):
+            ui = TerminalUI(stream=stream)
+            ui.banner("deepseek-v4-flash", Path("/workspace/demo"))
+            ui.event("[model]")
+            ui.stream_delta("reasoning", "private reasoning should stay collapsed")
+            ui.stream_delta("content", "working")
+            ui.prompt()
+        frame = stream.getvalue().rsplit("\033[H", 1)[-1]
+        self.assertIn("MODEL deepseek-v4-flash", frame)
+        self.assertIn("THINKING · COLLAPSED", frame)
+        self.assertNotIn("private reasoning should stay collapsed", frame)
+        self.assertIn("❯", frame)
+        self.assertEqual(stream.getvalue().count("\033[2K"), 20 * 5)
+
+    def test_tty_reasoning_expands_inside_bounded_scrolling_pane(self):
+        stream = FakeTTY()
+        with patch("coding_agent.shutil.get_terminal_size", return_value=os.terminal_size((80, 20))):
+            ui = TerminalUI(stream=stream)
+            ui.banner("test-model", Path("/workspace"))
+            ui.event("[model]")
+            ui.stream_delta("reasoning", "\n".join(f"reasoning-{i}" for i in range(10)))
+            self.assertTrue(ui.toggle_thinking())
+        frame = stream.getvalue().rsplit("\033[H", 1)[-1]
+        self.assertIn("THINKING · EXPANDED", frame)
+        self.assertIn("reasoning-9", frame)
+        self.assertNotIn("reasoning-0", frame)
+        self.assertEqual(frame.count("\033[2K"), 20)
+
+    def test_tty_tool_events_are_presented_as_one_card(self):
+        stream = FakeTTY()
+        with patch("coding_agent.shutil.get_terminal_size", return_value=os.terminal_size((80, 20))):
+            ui = TerminalUI(stream=stream)
+            ui.banner("test-model", Path("/workspace"))
+            ui.event("[tool 2.1] terminal")
+            ui.event("[command 2.1]\npython3 -m unittest")
+            ui.event("[result 2.1] exit=0 output=3 bytes")
+            ui.event("[output 2.1]\nOK")
+        frame = stream.getvalue().rsplit("\033[H", 1)[-1]
+        self.assertIn("TOOL 2.1 · terminal", frame)
+        self.assertIn("$ python3 -m unittest", frame)
+        self.assertIn("↳ exit=0 output=3 bytes", frame)
+        self.assertIn("OK", frame)
+        self.assertEqual(frame.count("TOOL 2.1"), 1)
+
+    def test_tty_activity_scrolls_without_moving_status_footer(self):
+        stream = FakeTTY()
+        with patch("coding_agent.shutil.get_terminal_size", return_value=os.terminal_size((80, 20))):
+            ui = TerminalUI(stream=stream)
+            ui.banner("test-model", Path("/workspace"))
+            for index in range(10):
+                event_id = f"{index + 1}.1"
+                ui.event(f"[tool {event_id}] terminal")
+                ui.event(f"[command {event_id}]\necho output-{index}")
+                ui.event(f"[result {event_id}] exit=0 output=10 bytes")
+                ui.event(f"[output {event_id}]\noutput-{index}")
+            ui.prompt()
+        frame = stream.getvalue().rsplit("\033[H", 1)[-1]
+        self.assertIn("output-9", frame)
+        self.assertNotIn("output-0", frame)
+        self.assertIn("MODEL test-model", frame)
+        self.assertIn("❯", frame)
+        self.assertEqual(frame.count("\033[2K"), 20)
 
 
 if __name__ == "__main__":
