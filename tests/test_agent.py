@@ -711,8 +711,9 @@ class TerminalUITest(unittest.TestCase):
         self.assertIn("MODEL deepseek-v4-flash", frame)
         self.assertNotIn("MODEL  deepseek-v4-flash", frame)
         self.assertNotIn("newest output stays visible", frame)
-        self.assertIn("THINKING · COLLAPSED", frame)
+        self.assertIn("THINKING · COMPLETE · COLLAPSED", frame)
         self.assertNotIn("private reasoning should stay collapsed", frame)
+        self.assertLess(frame.index("THINKING · COMPLETE"), frame.index("AGENT · LIVE"))
         self.assertIn("❯", frame)
         self.assertIn("\033[20;6H\033[?25h", frame)
         self.assertEqual(stream.getvalue().count("\033[2K"), 20 * 5)
@@ -726,17 +727,31 @@ class TerminalUITest(unittest.TestCase):
             ui.stream_delta("reasoning", "\n".join(f"reasoning-{i}" for i in range(10)))
             self.assertTrue(ui.toggle_thinking())
         frame = stream.getvalue().rsplit("\033[H", 1)[-1]
-        self.assertIn("THINKING · EXPANDED", frame)
+        self.assertIn("THINKING · LIVE", frame)
         self.assertIn("reasoning-9", frame)
         self.assertNotIn("reasoning-0", frame)
         self.assertEqual(frame.count("\033[2K"), 20)
+
+    def test_completed_thinking_card_expands_on_first_toggle(self):
+        stream = FakeTTY()
+        with patch("coding_agent.shutil.get_terminal_size", return_value=os.terminal_size((80, 20))):
+            ui = TerminalUI(stream=stream)
+            ui.banner("test-model", Path("/workspace"))
+            ui.toggle_thinking()
+            ui.event("[model]")
+            ui.stream_delta("reasoning", "completed reasoning")
+            ui.stream_delta("content", "formal output")
+            self.assertTrue(ui.toggle_thinking())
+        frame = stream.getvalue().rsplit("\033[H", 1)[-1]
+        self.assertIn("THINKING · COMPLETE", frame)
+        self.assertIn("completed reasoning", frame)
 
     def test_tty_tool_events_are_presented_as_one_card(self):
         stream = FakeTTY()
         with patch("coding_agent.shutil.get_terminal_size", return_value=os.terminal_size((80, 20))):
             ui = TerminalUI(stream=stream)
             ui.banner("test-model", Path("/workspace"))
-            ui.event("[tool 2.1] terminal")
+            ui.event("[tool 2.1] terminal: python3 -m unittest")
             ui.event("[command 2.1]\npython3 -m unittest")
             ui.event("[result 2.1] exit=0 output=3 bytes")
             ui.event("[output 2.1]\nOK")
@@ -746,6 +761,17 @@ class TerminalUITest(unittest.TestCase):
         self.assertIn("↳ exit=0 output=3 bytes", frame)
         self.assertIn("OK", frame)
         self.assertEqual(frame.count("TOOL 2.1"), 1)
+        self.assertEqual(frame.count("python3 -m unittest"), 1)
+
+    def test_tty_system_event_separates_title_from_inline_detail(self):
+        stream = FakeTTY()
+        with patch("coding_agent.shutil.get_terminal_size", return_value=os.terminal_size((80, 20))):
+            ui = TerminalUI(stream=stream)
+            ui.banner("test-model", Path("/workspace"))
+            ui.event("[planning checkpoint] deciding whether a plan is useful")
+        frame = stream.getvalue().rsplit("\033[H", 1)[-1]
+        self.assertIn("planning checkpoint: deciding whether a plan is useful", frame)
+        self.assertNotIn("checkpoint]", frame)
 
     def test_tty_activity_scrolls_without_moving_status_footer(self):
         stream = FakeTTY()
@@ -759,12 +785,59 @@ class TerminalUITest(unittest.TestCase):
                 ui.event(f"[result {event_id}] exit=0 output=10 bytes")
                 ui.event(f"[output {event_id}]\noutput-{index}")
             ui.prompt()
+            newest = stream.getvalue().rsplit("\033[H", 1)[-1]
+            ui.scroll(100)
+            oldest = stream.getvalue().rsplit("\033[H", 1)[-1]
+            ui.scroll(-100)
+            restored = stream.getvalue().rsplit("\033[H", 1)[-1]
+        self.assertIn("output-9", newest)
+        self.assertNotIn("output-0", newest)
+        self.assertIn("output-0", oldest)
+        self.assertNotIn("output-9", oldest)
+        self.assertIn("output-9", restored)
+        self.assertIn("MODEL test-model", restored)
+        self.assertIn("❯", restored)
+        self.assertEqual(restored.count("\033[2K"), 20)
+
+    def test_tty_preserves_thinking_output_sequence_across_model_rounds(self):
+        stream = FakeTTY()
+        with patch("coding_agent.shutil.get_terminal_size", return_value=os.terminal_size((100, 30))):
+            ui = TerminalUI(stream=stream)
+            ui.banner("test-model", Path("/workspace"))
+            ui.event("[model]")
+            ui.stream_delta("reasoning", "first reasoning")
+            ui.stream_delta("content", "First formal output")
+            ui.event("[model]")
+            ui.stream_delta("reasoning", "second reasoning")
+            ui.stream_delta("content", "Second formal output")
         frame = stream.getvalue().rsplit("\033[H", 1)[-1]
-        self.assertIn("output-9", frame)
-        self.assertNotIn("output-0", frame)
-        self.assertIn("MODEL test-model", frame)
-        self.assertIn("❯", frame)
-        self.assertEqual(frame.count("\033[2K"), 20)
+        first_thinking = frame.index("THINKING · COMPLETE")
+        first_output = frame.index("First formal output")
+        second_thinking = frame.index("THINKING · COMPLETE", first_thinking + 1)
+        second_output = frame.index("Second formal output")
+        self.assertLess(first_thinking, first_output)
+        self.assertLess(first_output, second_thinking)
+        self.assertLess(second_thinking, second_output)
+
+    def test_tty_renders_markdown_and_aligns_cjk_borders(self):
+        stream = FakeTTY()
+        with patch("coding_agent.shutil.get_terminal_size", return_value=os.terminal_size((80, 22))):
+            ui = TerminalUI(stream=stream)
+            ui.banner("test-model", Path("/工作区/演示"))
+            ui.answer("# 总结\n\n**结果**：创建了 `你好.txt`。\n\n- 第一项内容很长，需要正确换行而不能挤坏右侧边框")
+        frame = stream.getvalue().rsplit("\033[H", 1)[-1]
+        self.assertIn("▌ 总结", frame)
+        self.assertIn("• 第一项", frame)
+        self.assertNotIn("**结果**", frame)
+        self.assertNotIn("`你好.txt`", frame)
+        visible_lines = [ui._clean(line) for line in frame.splitlines() if "│" in ui._clean(line)]
+        for line in visible_lines:
+            self.assertEqual(ui._cell_width(line), 80, line)
+
+    def test_mouse_wheel_sequences_are_recognized(self):
+        self.assertEqual(TerminalUI._mouse_button(b"\x1b[<64;10;5M"), 64)
+        self.assertEqual(TerminalUI._mouse_button(b"\x1b[<65;10;5M"), 65)
+        self.assertIsNone(TerminalUI._mouse_button(b"\x1b[A"))
 
 
 if __name__ == "__main__":

@@ -8,12 +8,14 @@ import http.client
 import json
 import os
 import re
+import select
 import signal
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -557,6 +559,7 @@ class TerminalUI:
     GREEN = "\033[38;5;78m"
     YELLOW = "\033[38;5;221m"
     RED = "\033[38;5;203m"
+    THINKING_WINDOW_LINES = 6
 
     BANNER = (
         " ██████╗ ██████╗ ██████╗ ██╗███╗   ██╗ ██████╗      █████╗  ██████╗ ███████╗███╗   ██╗████████╗\n"
@@ -579,12 +582,20 @@ class TerminalUI:
         self._live_content = ""
         self._reasoning_text = ""
         self._thinking_expanded = False
+        self._thinking_entry: dict[str, Any] | None = None
         self._entries: list[dict[str, Any]] = []
         self._tool_entries: dict[str, dict[str, Any]] = {}
         self._plan_entry: dict[str, Any] | None = None
         self._model = "unknown"
         self._workspace = Path(".")
         self._status = "ready"
+        self._model_phase = "idle"
+        self._scroll_offset = 0
+        self._input_text = ""
+        self._input_active = False
+        self._ui_lock = threading.RLock()
+        self._mouse_stop: threading.Event | None = None
+        self._mouse_thread: threading.Thread | None = None
         self._screen_started = False
 
     def _paint(self, text: str, *styles: str) -> str:
@@ -609,13 +620,43 @@ class TerminalUI:
         return "".join(char for char in text if char in "\n\r\t" or ord(char) >= 32)
 
     @staticmethod
-    def _fit(text: str, width: int) -> str:
+    def _cell_width(text: str) -> int:
+        import unicodedata
+
+        width = 0
+        for char in text:
+            if char in "\n\r":
+                continue
+            if unicodedata.combining(char):
+                continue
+            if unicodedata.east_asian_width(char) in {"W", "F"}:
+                width += 2
+            else:
+                width += 1
+        return width
+
+    @classmethod
+    def _fit(cls, text: str, width: int) -> str:
         text = text.replace("\t", "    ").replace("\r", "")
         if width <= 0:
             return ""
-        if len(text) > width:
-            return text[: max(0, width - 1)] + "…"
-        return text.ljust(width)
+        used = 0
+        output: list[str] = []
+        for char in text:
+            char_width = cls._cell_width(char)
+            if used + char_width > width:
+                break
+            output.append(char)
+            used += char_width
+        if used < cls._cell_width(text):
+            ellipsis_width = cls._cell_width("…")
+            if used + ellipsis_width > width and output:
+                removed = output.pop()
+                used -= cls._cell_width(removed)
+            if used + ellipsis_width <= width:
+                output.append("…")
+                used += ellipsis_width
+        return "".join(output) + " " * max(0, width - used)
 
     def _frame_line(self, text: str, width: int, color: str = "") -> str:
         inner = self._fit(self._clean(text), max(1, width - 4))
@@ -630,6 +671,82 @@ class TerminalUI:
         if len(self._entries) > 140:
             self._entries = self._entries[-140:]
 
+    def _commit_live_content(self) -> None:
+        if self._live_content:
+            self._append_entry({"kind": "agent", "body": self._live_content})
+            self._live_content = ""
+
+    @staticmethod
+    def _markdown_inline(text: str) -> str:
+        text = re.sub(r"!\[([^]]*)\]\([^)]*\)", r"[\1]", text)
+        text = re.sub(r"\[([^]]+)\]\(([^)]+)\)", r"\1 (\2)", text)
+        text = re.sub(r"(`+)(.*?)\1", r"\2", text)
+        text = re.sub(r"(\*\*|__)(.*?)\1", r"\2", text)
+        text = re.sub(r"(?<!\w)(\*|_)(.*?)\1(?!\w)", r"\2", text)
+        return text
+
+    @classmethod
+    def _markdown_lines(cls, text: str) -> list[str]:
+        """Render the small Markdown subset useful in terminal summaries."""
+        lines: list[str] = []
+        in_code = False
+        for raw_line in cls._clean(text).splitlines():
+            stripped = raw_line.strip()
+            if stripped.startswith("```"):
+                if in_code:
+                    lines.append("└─ code")
+                else:
+                    language = stripped[3:].strip()
+                    lines.append(f"┌─ code{(' · ' + language) if language else ''}")
+                in_code = not in_code
+                continue
+            if in_code:
+                lines.append("│ " + raw_line)
+                continue
+            heading = re.match(r"^#{1,6}\s+(.*)$", stripped)
+            if heading:
+                lines.append("▌ " + cls._markdown_inline(heading.group(1)))
+                continue
+            bullet = re.match(r"^[-*+]\s+(.*)$", stripped)
+            if bullet:
+                lines.append("• " + cls._markdown_inline(bullet.group(1)))
+                continue
+            quote = re.match(r"^>\s?(.*)$", stripped)
+            if quote:
+                lines.append("│ " + cls._markdown_inline(quote.group(1)))
+                continue
+            lines.append(cls._markdown_inline(raw_line))
+        if in_code:
+            lines.append("└─ code")
+        return lines or [""]
+
+    @classmethod
+    def _wrap_display_line(cls, text: str, width: int) -> list[str]:
+        """Wrap one line by terminal cells, including full-width CJK glyphs."""
+        if width <= 0:
+            return [""]
+        text = text.replace("\t", "    ").replace("\r", "")
+        if not text:
+            return [""]
+        wrapped: list[str] = []
+        current: list[str] = []
+        used = 0
+        for char in text:
+            char_width = cls._cell_width(char)
+            if current and used + char_width > width:
+                wrapped.append("".join(current))
+                current = []
+                used = 0
+            current.append(char)
+            used += char_width
+        if current:
+            wrapped.append("".join(current))
+        return wrapped or [""]
+
+    @classmethod
+    def _wrap_display_lines(cls, lines: list[str], width: int) -> list[str]:
+        return [part for line in lines for part in cls._wrap_display_line(line, width)]
+
     def _terminal_size(self) -> tuple[int, int]:
         columns, rows = shutil.get_terminal_size((100, 28))
         return max(48, min(columns, 120)), max(14, rows)
@@ -642,7 +759,7 @@ class TerminalUI:
             return "✗", self.RED
         return "·", self.YELLOW
 
-    def _history_lines(self) -> list[str]:
+    def _history_lines(self, content_width: int | None = None) -> list[str]:
         lines: list[str] = []
         for entry in self._entries:
             kind = entry.get("kind")
@@ -678,8 +795,24 @@ class TerminalUI:
                 lines.append("└─")
             elif kind == "agent":
                 lines.append("┌─ AGENT")
-                lines.extend(f"│ {line}" for line in self._clean(str(entry.get("body", ""))).splitlines())
+                lines.extend(f"│ {line}" for line in self._markdown_lines(str(entry.get("body", ""))))
                 lines.append("└─")
+            elif kind == "thinking":
+                body = str(entry.get("body", ""))
+                active = bool(entry.get("active"))
+                if entry.get("expanded"):
+                    lines.append("┌─ THINKING · " + ("LIVE" if active else "COMPLETE"))
+                    reasoning_lines = self._markdown_lines(body)
+                    if content_width is not None:
+                        reasoning_lines = self._wrap_display_lines(reasoning_lines, content_width - 2)
+                    visible = reasoning_lines[-(self.THINKING_WINDOW_LINES - 2) :]
+                    lines.extend(f"│ {line}" for line in visible)
+                    lines.extend("│ " for _ in range(self.THINKING_WINDOW_LINES - 2 - len(visible)))
+                    lines.append("└─")
+                else:
+                    label = "LIVE · COLLAPSED" if active else "COMPLETE · COLLAPSED"
+                    lines.append(f"┌─ THINKING · {label} · {len(body)} chars")
+                    lines.append("└─")
             elif kind == "error":
                 lines.append(f"✗ ERROR  {self._clean(str(entry.get('body', '')))}")
             else:
@@ -687,17 +820,25 @@ class TerminalUI:
                 body = self._clean(str(entry.get("body", "")))
                 lines.append(f"• {title}{(': ' + body) if body else ''}")
 
-        if self._live_content:
+        if self._model_phase == "content" and self._live_content:
             lines.append("┌─ AGENT · LIVE")
-            lines.extend(f"│ {line}" for line in self._clean(self._live_content).splitlines())
+            lines.extend(f"│ {line}" for line in self._markdown_lines(self._live_content))
             lines.append("└─")
+        if content_width is not None:
+            return self._wrap_display_lines(lines, content_width)
         return lines
 
-    def _render_tty(self, input_active: bool = False) -> None:
+    def _render_tty(self, input_active: bool = False, input_text: str | None = None) -> None:
+        with self._ui_lock:
+            self._render_tty_unlocked(input_active=input_active, input_text=input_text)
+
+    def _render_tty_unlocked(self, input_active: bool = False, input_text: str | None = None) -> None:
         if not self.interactive:
             return
+        self._input_active = input_active
+        if input_text is not None:
+            self._input_text = input_text
         width, rows = self._terminal_size()
-        thinking_height = 1 if not self._thinking_expanded else min(7, max(3, rows // 4))
         header = [
             self._border(width, "╭", "╮"),
             self._frame_line("CODING AGENT", width, self.CYAN),
@@ -707,42 +848,26 @@ class TerminalUI:
         footer = [
             self._border(width, "├", "┤"),
             self._frame_line(
-                f"MODEL {self._model}   ·   STATUS {self._status}   ·   /thinking toggle   /clear   /exit",
+                f"MODEL {self._model}   ·   STATUS {self._status}   ·   MOUSE SCROLL   ·   /thinking   /clear   /exit",
                 width,
                 self.DIM,
             ),
         ]
-        prompt_text = "❯ " if input_active else f"◌ {self._status} …"
+        prompt_text = ("❯ " + self._input_text) if input_active else f"◌ {self._status} …"
         footer.append("╰─ " + self._fit(prompt_text, max(1, width - 5)) + " │")
 
-        body_height = max(2, rows - len(header) - thinking_height - len(footer))
-        activity = self._history_lines()
-        activity = activity[-body_height:]
+        body_height = max(2, rows - len(header) - len(footer))
+        activity = self._history_lines(width - 4)
+        if self._scroll_offset:
+            maximum = max(0, len(activity) - body_height)
+            self._scroll_offset = min(self._scroll_offset, maximum)
+            end = max(0, len(activity) - self._scroll_offset)
+            activity = activity[max(0, end - body_height) : end]
+        else:
+            activity = activity[-body_height:]
         body = [self._frame_line(line, width) for line in activity]
         body.extend(self._frame_line("", width) for _ in range(body_height - len(body)))
-
-        if self._thinking_expanded:
-            thinking_lines = self._clean(self._reasoning_text).splitlines() or ["(no reasoning text yet)"]
-            visible = thinking_lines[-max(1, thinking_height - 1):]
-            thinking = [
-                self._frame_line(
-                    f"THINKING · EXPANDED  ({len(self._reasoning_text)} chars)  ·  /thinking to collapse",
-                    width,
-                    self.PURPLE,
-                )
-            ]
-            thinking.extend(self._frame_line("  " + line, width, self.DIM) for line in visible)
-            thinking.extend(self._frame_line("", width) for _ in range(thinking_height - len(thinking)))
-        else:
-            thinking = [
-                self._frame_line(
-                    f"THINKING · COLLAPSED  ({len(self._reasoning_text)} chars)  ·  /thinking to expand",
-                    width,
-                    self.PURPLE,
-                )
-            ]
-
-        frame = (header + body + thinking + footer)[:rows]
+        frame = (header + body + footer)[:rows]
         frame.extend("" for _ in range(rows - len(frame)))
         rendered = "\033[H\033[2J"
         rendered += "".join("\033[2K" + line + "\n" for line in frame[:-1])
@@ -750,19 +875,30 @@ class TerminalUI:
         if input_active:
             # The prompt line is padded to the frame width, so explicitly put
             # the real input cursor immediately after the left-side arrow.
-            cursor_column = len("╰─ " + prompt_text) + 1
+            cursor_column = self._cell_width("╰─ " + prompt_text) + 1
             rendered += f"\033[{rows};{cursor_column}H\033[?25h"
         else:
             rendered += "\033[?25l"
         self.stream.write(rendered)
         self.stream.flush()
 
+    def scroll(self, delta: int) -> None:
+        """Move the activity viewport; positive values move toward older output."""
+        if not self.interactive or not delta:
+            return
+        _, rows = self._terminal_size()
+        body_height = max(2, rows - 4 - 3)
+        width, _ = self._terminal_size()
+        maximum = max(0, len(self._history_lines(width - 4)) - body_height)
+        self._scroll_offset = max(0, min(maximum, self._scroll_offset + delta))
+        self._render_tty(input_active=self._input_active)
+
     def banner(self, model: str, workspace: Path) -> None:
         self._model = model
         self._workspace = workspace
         if self.interactive:
             self._screen_started = True
-            self.stream.write("\033[?1049h\033[?25l")
+            self.stream.write("\033[?1049h\033[?1000h\033[?1006h\033[?25l")
             self.stream.flush()
             self._render_tty()
             return
@@ -776,6 +912,144 @@ class TerminalUI:
         self._write(self._paint(self._rule(), self.DIM))
         self._write(self._paint("  /thinking toggle reasoning   /clear reset conversation   /exit quit", self.DIM))
 
+    @staticmethod
+    def _read_byte(fd: int, timeout: float | None = None) -> bytes | None:
+        try:
+            ready, _, _ = select.select([fd], [], [], timeout)
+        except (OSError, ValueError):
+            return b""
+        if not ready:
+            return None
+        try:
+            return os.read(fd, 1)
+        except OSError:
+            return b""
+
+    @staticmethod
+    def _mouse_button(sequence: bytes) -> int | None:
+        match = re.fullmatch(rb"\x1b\[<([0-9]+);[0-9]+;[0-9]+[Mm]", sequence)
+        return int(match.group(1)) if match else None
+
+    def _mouse_loop(self) -> None:
+        import termios
+        import tty
+
+        try:
+            fd = sys.stdin.fileno()
+            previous = termios.tcgetattr(fd)
+        except (AttributeError, OSError, ValueError):
+            return
+        try:
+            tty.setraw(fd)
+            while self._mouse_stop is not None and not self._mouse_stop.is_set():
+                first = self._read_byte(fd, 0.1)
+                if first is None:
+                    continue
+                if not first:
+                    break
+                if first != b"\x1b":
+                    continue
+                sequence = bytearray(first)
+                for _ in range(24):
+                    next_byte = self._read_byte(fd, 0.05)
+                    if next_byte is None or not next_byte:
+                        break
+                    sequence.extend(next_byte)
+                    if next_byte in {b"M", b"m"}:
+                        break
+                button = self._mouse_button(bytes(sequence))
+                if button == 64:
+                    self.scroll(4)
+                elif button == 65:
+                    self.scroll(-4)
+        finally:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, previous)
+            except (OSError, ValueError):
+                pass
+
+    def begin_task(self) -> None:
+        """Listen for mouse-wheel navigation while the model is working."""
+        if not self.interactive or self._mouse_thread is not None:
+            return
+        self._scroll_offset = 0
+        self._mouse_stop = threading.Event()
+        self._mouse_thread = threading.Thread(target=self._mouse_loop, daemon=True)
+        self._mouse_thread.start()
+
+    def end_task(self) -> None:
+        if self._mouse_stop is not None:
+            self._mouse_stop.set()
+        if self._mouse_thread is not None:
+            self._mouse_thread.join(timeout=0.5)
+        self._mouse_stop = None
+        self._mouse_thread = None
+
+    def read_prompt(self) -> str:
+        """Read a prompt without surrendering mouse-wheel navigation to the shell."""
+        if not self.interactive:
+            return input(self.prompt())
+
+        import termios
+        import tty
+
+        fd = sys.stdin.fileno()
+        previous = termios.tcgetattr(fd)
+        buffer = ""
+        self._input_active = True
+        self._scroll_offset = 0
+        self._render_tty(input_active=True, input_text=buffer)
+        try:
+            tty.setraw(fd)
+            while True:
+                byte = self._read_byte(fd, None)
+                if not byte:
+                    raise EOFError
+                if byte in {b"\r", b"\n"}:
+                    return buffer
+                if byte in {b"\x03", b"\x04"}:
+                    raise KeyboardInterrupt
+                if byte in {b"\x7f", b"\x08"}:
+                    buffer = buffer[:-1]
+                    self._render_tty(input_active=True, input_text=buffer)
+                    continue
+                if byte == b"\x1b":
+                    sequence = bytearray(byte)
+                    for _ in range(24):
+                        next_byte = self._read_byte(fd, 0.05)
+                        if next_byte is None or not next_byte:
+                            break
+                        sequence.extend(next_byte)
+                        if next_byte in {b"M", b"m"}:
+                            break
+                    button = self._mouse_button(bytes(sequence))
+                    if button == 64:
+                        self.scroll(4)
+                    elif button == 65:
+                        self.scroll(-4)
+                    continue
+
+                pending = bytearray(byte)
+                while True:
+                    try:
+                        character = pending.decode("utf-8")
+                        break
+                    except UnicodeDecodeError:
+                        next_byte = self._read_byte(fd, None)
+                        if not next_byte:
+                            character = pending.decode("utf-8", "replace")
+                            break
+                        pending.extend(next_byte)
+                        if len(pending) >= 4:
+                            character = pending.decode("utf-8", "replace")
+                            break
+                buffer += character
+                self._render_tty(input_active=True, input_text=buffer)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, previous)
+            self._input_active = False
+            self._render_tty()
+
     def _panel(self, title: str, body: str, color: str) -> None:
         self._write()
         self._write(self._paint(f"◆ {title}", self.BOLD, color))
@@ -786,21 +1060,49 @@ class TerminalUI:
         head, separator, body = message.partition("\n")
         self._close_stream()
         if head == "[model]":
+            self._commit_live_content()
             self._streamed_content = ""
-            self._live_content = ""
             self._reasoning_text = ""
             self._status = "thinking"
+            self._model_phase = "thinking"
+            self._thinking_entry = {
+                "kind": "thinking",
+                "body": "",
+                "active": True,
+                "expanded": self._thinking_expanded,
+            }
+            self._append_entry(self._thinking_entry)
         if self.interactive:
             if head == "[thinking]":
                 self._reasoning_text = body
+                if self._thinking_entry is None:
+                    self._thinking_entry = {
+                        "kind": "thinking",
+                        "body": body,
+                        "active": True,
+                        "expanded": self._thinking_expanded,
+                    }
+                    self._append_entry(self._thinking_entry)
+                else:
+                    self._thinking_entry["body"] = body
                 self._status = "thinking"
+                self._model_phase = "thinking"
             elif head.startswith("[tool "):
+                if self._thinking_entry is not None:
+                    self._thinking_entry["active"] = False
+                    self._thinking_entry["expanded"] = False
+                self._commit_live_content()
                 event_id = head[len("[tool ") : head.find("]")]
-                name = head.split("]", 1)[1].strip()
+                # Tool events may include a human-readable command preview after
+                # the tool name.  The command has its own card row, so keeping
+                # only the actual name avoids presenting the same command twice.
+                tool_label = head.split("]", 1)[1].strip()
+                name = tool_label.split(":", 1)[0].strip() or "tool"
                 entry = {"kind": "tool", "id": event_id, "name": name, "status": "running"}
                 self._tool_entries[event_id] = entry
                 self._append_entry(entry)
                 self._status = "running"
+                self._model_phase = "tool"
             elif head.startswith("[command "):
                 event_id = head[len("[command ") : head.find("]")]
                 entry = self._tool_entries.get(event_id)
@@ -828,14 +1130,24 @@ class TerminalUI:
                 else:
                     self._plan_entry["items"] = items if isinstance(items, list) else []
             elif head.startswith("[done]"):
+                if self._thinking_entry is not None:
+                    self._thinking_entry["active"] = False
+                    self._thinking_entry["expanded"] = False
                 self._status = "ready"
+                self._model_phase = "idle"
                 self._append_entry({"kind": "system", "title": "DONE", "body": head[6:].strip()})
             elif head.startswith("[error]"):
                 self._status = "error"
                 self._append_entry({"kind": "error", "body": body or head[7:].strip()})
             elif head != "[model]":
-                title = head.strip("[]") or "event"
-                self._append_entry({"kind": "system", "title": title, "body": body})
+                closing = head.find("]") if head.startswith("[") else -1
+                if closing >= 0:
+                    title = head[1:closing] or "event"
+                    inline_body = head[closing + 1 :].strip()
+                else:
+                    title = head or "event"
+                    inline_body = ""
+                self._append_entry({"kind": "system", "title": title, "body": body or inline_body})
             self._render_tty()
             return
         if self.plain:
@@ -896,8 +1208,16 @@ class TerminalUI:
                 return
             self._stream_kind = kind
             if kind == "reasoning":
+                self._model_phase = "thinking"
                 self._reasoning_text = _clip(self._reasoning_text + text, 16_000)
+                if self._thinking_entry is not None:
+                    self._thinking_entry["body"] = self._reasoning_text
             else:
+                if self._thinking_entry is not None:
+                    self._thinking_entry["active"] = False
+                    self._thinking_entry["expanded"] = False
+                self._model_phase = "content"
+                self._status = "responding"
                 self._streamed_content += text
                 self._live_content = _clip(self._live_content + text, 20_000)
             self._render_tty()
@@ -947,8 +1267,13 @@ class TerminalUI:
         self._write(self._paint(f"\n✗ ERROR  {text}", self.RED, self.BOLD))
 
     def toggle_thinking(self) -> bool:
-        """Toggle the bounded reasoning pane; returns its new state."""
-        self._thinking_expanded = not self._thinking_expanded
+        """Toggle the latest reasoning card and the default for future cards."""
+        if self._thinking_entry is not None:
+            expanded = not bool(self._thinking_entry.get("expanded"))
+            self._thinking_entry["expanded"] = expanded
+            self._thinking_expanded = expanded
+        else:
+            self._thinking_expanded = not self._thinking_expanded
         if self.interactive:
             self._render_tty()
         return self._thinking_expanded
@@ -962,7 +1287,8 @@ class TerminalUI:
     def close(self) -> None:
         """Restore the terminal after leaving the dedicated dashboard."""
         if self.interactive and self._screen_started:
-            self.stream.write("\033[?25h\033[?1049l\n")
+            self.end_task()
+            self.stream.write("\033[?1000l\033[?1006l\033[?25h\033[?1049l\n")
             self.stream.flush()
             self._screen_started = False
 
@@ -1446,14 +1772,21 @@ def main() -> int:
             on_stream=ui.stream_delta,
         )
         ui.banner(config.model, workspace)
+
+        def run_task(text: str) -> str:
+            ui.begin_task()
+            try:
+                return agent.run(text)
+            finally:
+                ui.end_task()
+
         if args.prompt:
-            ui.answer(agent.run(" ".join(args.prompt)))
+            ui.answer(run_task(" ".join(args.prompt)))
             return 0
         while True:
             try:
-                text = input(ui.prompt()).strip()
+                text = ui.read_prompt().strip()
             except (EOFError, KeyboardInterrupt):
-                print()
                 return 0
             if not text:
                 continue
@@ -1461,7 +1794,7 @@ def main() -> int:
                 return 0
             if text in {"/thinking", "/toggle-thinking"}:
                 state = "expanded" if ui.toggle_thinking() else "collapsed"
-                ui.event(f"[ui] reasoning pane {state}")
+                ui.event(f"[ui] reasoning card {state}")
                 continue
             if text == "/clear":
                 agent.messages = [dict(agent.system_message)]
@@ -1469,7 +1802,7 @@ def main() -> int:
                 ui.event("Conversation cleared.")
                 continue
             try:
-                ui.answer(agent.run(text))
+                ui.answer(run_task(text))
             except AgentError as exc:
                 ui.error(str(exc))
     except AgentError as exc:
