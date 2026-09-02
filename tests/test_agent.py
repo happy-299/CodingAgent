@@ -282,7 +282,7 @@ class AgentLoopTest(unittest.TestCase):
                 "type": "function",
                 "function": {"name": "terminal", "arguments": '{"command":"printf work"}'},
             }
-            for number in range(6)
+            for number in range(8)
         ]
         completed = {
             "id": "plan-complete",
@@ -416,7 +416,7 @@ class ConfigTest(unittest.TestCase):
         with patch.dict(os.environ, {"OPENAI_API_KEY": "test"}, clear=True):
             loaded = Config.from_env()
         self.assertEqual(loaded.reasoning_effort, "medium")
-        self.assertEqual(loaded.max_history_chars, 120_000)
+        self.assertEqual(loaded.max_history_chars, 160_000)
 
 
 class DeepSeekClientTest(unittest.TestCase):
@@ -565,6 +565,68 @@ class ArchitectureTest(unittest.TestCase):
         self.assertEqual(compacted[-2]["role"], "assistant")
         self.assertEqual(compacted[-1]["role"], "tool")
         self.assertEqual(compacted[-2]["tool_calls"][0]["id"], compacted[-1]["tool_call_id"])
+
+    def test_reasoning_compaction_preserves_protocol_and_recent_thoughts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            agent = CodingAgent(
+                ScriptedClient([]),
+                Path(directory),
+                config(max_history_chars=10_000),
+                on_event=lambda _: None,
+            )
+        messages = [{"role": "system", "content": "system"}]
+        for number in range(5):
+            messages.extend([
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": str(number) * 4_000,
+                    "tool_calls": [{
+                        "id": f"call-{number}",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{}"},
+                    }],
+                },
+                {"role": "tool", "tool_call_id": f"call-{number}", "content": "observed"},
+            ])
+        condensed = agent._condense_reasoning_history(messages)
+        self.assertEqual(len(condensed), len(messages))
+        self.assertLess(len(condensed[1]["reasoning_content"]), 4_000)
+        self.assertEqual(condensed[-4]["reasoning_content"], "3" * 4_000)
+        self.assertEqual(condensed[-2]["reasoning_content"], "4" * 4_000)
+        for assistant, tool in zip(condensed[1::2], condensed[2::2]):
+            self.assertEqual(assistant["tool_calls"][0]["id"], tool["tool_call_id"])
+
+    def test_model_context_compacts_reasoning_before_dropping_protocol_units(self):
+        events = []
+        with tempfile.TemporaryDirectory() as directory:
+            agent = CodingAgent(
+                ScriptedClient([]),
+                Path(directory),
+                config(max_history_chars=20_000),
+                on_event=events.append,
+            )
+        agent.messages.append({"role": "user", "content": "objective"})
+        agent.task_start = 1
+        agent.memory.reset("objective", [])
+        for number in range(4):
+            agent.messages.extend([
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": str(number) * 5_000,
+                    "tool_calls": [{
+                        "id": f"call-{number}",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{}"},
+                    }],
+                },
+                {"role": "tool", "tool_call_id": f"call-{number}", "content": "result"},
+            ])
+        compacted = agent._messages_for_model()
+        self.assertEqual(len(compacted), len(agent.messages))
+        self.assertLess(len(json.dumps(compacted)), len(json.dumps(agent.messages)))
+        self.assertTrue(any("reasoning_compacted" in event for event in events))
 
 
 class TerminalUITest(unittest.TestCase):

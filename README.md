@@ -85,7 +85,7 @@ OPENAI_API_KEY=your-deepseek-api-key
 OPENAI_MODEL=deepseek-v4-flash
 AGENT_API_TIMEOUT=180
 AGENT_MAX_ROUNDS=30
-AGENT_MAX_HISTORY_CHARS=120000
+AGENT_MAX_HISTORY_CHARS=160000
 AGENT_MAX_OUTPUT_TOKENS=32768
 AGENT_REASONING_EFFORT=medium
 ```
@@ -96,7 +96,7 @@ AGENT_REASONING_EFFORT=medium
 python3 -m unittest discover -v
 ```
 
-35 项单元测试覆盖 terminal、终端 UI、配置、上下文、模型输出解析、agent 循环、规划检查点和流式协议。真实 DeepSeek V4 Flash 除完成三个修复类任务外，还从两个全空目录执行了同一句 2048 高层任务；完整日志和人工试玩暴露了范围膨胀、重复验证以及“只看退出码”的假阳性，并推动了推理预算、规划节奏和验证语义的通用优化。详细过程见 [`EVALUATION.md`](EVALUATION.md)。
+37 项单元测试覆盖 terminal、终端 UI、配置、上下文、模型输出解析、agent 循环、规划检查点和流式协议。真实 DeepSeek V4 Flash 除完成三个修复类任务外，还从三个全空目录执行了同一句 2048 高层任务；完整日志和人工试玩暴露了范围膨胀、重复验证、“只看退出码”的假阳性和上下文成本问题，并推动了推理预算、规划节奏、证据检查和分层上下文的通用优化。详细过程见 [`EVALUATION.md`](EVALUATION.md)。
 
 ## 已知边界
 

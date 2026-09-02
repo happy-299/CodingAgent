@@ -22,7 +22,9 @@ from typing import Any, Callable
 
 
 MAX_TOOL_OUTPUT = 20_000
-PLAN_REVIEW_TERMINAL_INTERVAL = 6
+PLAN_REVIEW_TERMINAL_INTERVAL = 8
+HISTORICAL_REASONING_CHARS = 1_000
+RECENT_REASONING_UNITS = 2
 SENSITIVE_ENV_PARTS = {"KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "CREDENTIALS"}
 SENSITIVE_ENV_SUFFIXES = (
     "APIKEY",
@@ -72,7 +74,7 @@ class Config:
     model: str
     timeout: int = 180
     max_rounds: int = 30
-    max_history_chars: int = 120_000
+    max_history_chars: int = 160_000
     max_output_tokens: int = 32_768
     reasoning_effort: str = "medium"
 
@@ -93,7 +95,7 @@ class Config:
             model=os.getenv("OPENAI_MODEL", "deepseek-v4-flash"),
             timeout=_env_int("AGENT_API_TIMEOUT", 180, 1, 600),
             max_rounds=_env_int("AGENT_MAX_ROUNDS", 30, 1, 100),
-            max_history_chars=_env_int("AGENT_MAX_HISTORY_CHARS", 120_000, 10_000, 10_000_000),
+            max_history_chars=_env_int("AGENT_MAX_HISTORY_CHARS", 160_000, 10_000, 10_000_000),
             max_output_tokens=_env_int("AGENT_MAX_OUTPUT_TOKENS", 32_768, 1_024, 384_000),
             reasoning_effort=reasoning_effort,
         )
@@ -485,10 +487,10 @@ class DeepSeekClient:
 SYSTEM_PROMPT = """You are a careful coding agent operating in a local workspace.
 Translate the user's request into concrete acceptance criteria and keep every action anchored to them. Choose each next action from the workspace and observed evidence rather than a prewritten task-specific playbook.
 Begin with the smallest orientation that removes important uncertainty. After that orientation, if the work is non-trivial, create a short outcome-oriented plan before extensive design or implementation; otherwise proceed directly. Planning is your decision, not a mandatory first action. Keep a plan current when evidence changes it, and complete or block every item before finishing.
-Keep analysis proportional to the next decision. Once there is enough information for a safe, useful action, act and observe instead of exhaustively enumerating options or simulating details that can be checked cheaply. Completeness means satisfying all required behavior, not maximizing feature count. Where requirements leave design choices open, choose one coherent minimal design; do not build multiple alternatives or ancillary subsystems unless an acceptance criterion needs them.
+Keep analysis proportional and concise. Once there is enough information for a safe, useful action, act and observe instead of restating settled requirements, exhaustively enumerating options, or simulating details that can be checked cheaply. Completeness means satisfying all required behavior, not maximizing feature count. Where requirements leave design choices open, choose one coherent minimal design, stop probing alternatives once it is viable, and do not build ancillary subsystems unless an acceptance criterion needs them.
 Use the terminal and standard command-line programs to inspect, search, read, edit, create, build, and test. Every terminal call starts at the exact selected workspace root. Use relative paths by default, confirm location only when uncertain, and never replace the current directory with a guessed path. The exact root is also available as CODING_AGENT_WORKSPACE.
 Respect the requested scope and preserve unrelated work. Do not change the workspace when the user only authorized inspection or an answer. The terminal is not an OS sandbox, so keep operations inside the workspace unless the user explicitly requests otherwise. Never inspect or print credentials, .env files, private keys, or secret environment variables.
-Treat command failures as evidence: check both the implementation and the expectation behind a failing check, diagnose the cause, and recover when possible. Before finishing, reconcile every acceptance criterion with concrete observed evidence and run the most relevant available checks. A successful command proves only the behavior it actually exercised: inspect its output and side effects, and use meaningful assertions that could fail when behavior is wrong. Reuse successful evidence while it remains valid; repeat a check only when a relevant change, failure, or specific evidence gap justifies it. Never claim success without supporting terminal output.
+Treat command failures as evidence: check both the implementation and the expectation behind a failing check, diagnose the cause, and recover when possible. Settle the structure before emitting a large edit; after that, prefer focused corrections over rewriting unchanged content. Before finishing, reconcile every acceptance criterion with concrete observed evidence and run the smallest set of checks that covers distinct required behaviors. A successful command proves only the behavior it actually exercised: inspect its output and side effects, and use meaningful assertions that could fail when behavior is wrong. Reuse successful evidence while it remains valid; repeat a check only when a relevant change, failure, or specific evidence gap justifies it. Never claim success without supporting terminal output.
 Stop using tools when the request is complete or genuinely blocked, not merely because a round budget is near. Then respond with a concise, honest summary of changes, checks, and anything unresolved."""
 
 
@@ -708,12 +710,45 @@ class CodingAgent:
             units.append(current)
         return units
 
+    @staticmethod
+    def _condense_reasoning_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Bound old internal reasoning while preserving every protocol message."""
+        reasoning_indexes = [
+            index
+            for index, message in enumerate(messages)
+            if isinstance(message.get("reasoning_content"), str)
+        ]
+        preserve = set(reasoning_indexes[-RECENT_REASONING_UNITS:])
+        condensed: list[dict[str, Any]] = []
+        for index, message in enumerate(messages):
+            reasoning = message.get("reasoning_content")
+            if (
+                index not in preserve
+                and isinstance(reasoning, str)
+                and len(reasoning) > HISTORICAL_REASONING_CHARS
+            ):
+                message = dict(message)
+                message["reasoning_content"] = _clip(reasoning, HISTORICAL_REASONING_CHARS)
+            condensed.append(message)
+        return condensed
+
     def _messages_for_model(self) -> list[dict[str, Any]]:
         raw_size = len(json.dumps(self.messages, ensure_ascii=False))
+        reasoning_trigger = self.config.max_history_chars // 2
+        candidate = self.messages
+        if raw_size > reasoning_trigger:
+            candidate = self._condense_reasoning_history(self.messages)
+        candidate_size = len(json.dumps(candidate, ensure_ascii=False))
+        if candidate_size <= self.config.max_history_chars:
+            if candidate_size < raw_size:
+                self.on_event(
+                    f"[context] raw={raw_size} chars reasoning_compacted={candidate_size} chars"
+                )
+            return candidate
         if raw_size <= self.config.max_history_chars:
             return self.messages
-        system = dict(self.messages[0])
-        objective = dict(self.messages[self.task_start])
+        system = dict(candidate[0])
+        objective = dict(candidate[self.task_start])
         memory_text = self.memory.render(self.plan)
         memory_message = {
             "role": "system",
@@ -727,7 +762,7 @@ class CodingAgent:
         budget = max(0, self.config.max_history_chars - base_size)
         kept: list[list[dict[str, Any]]] = []
         used = 0
-        for unit in reversed(self._protocol_units(self.messages[self.task_start + 1 :])):
+        for unit in reversed(self._protocol_units(candidate[self.task_start + 1 :])):
             size = len(json.dumps(unit, ensure_ascii=False))
             if kept and used + size > budget:
                 break
@@ -735,7 +770,8 @@ class CodingAgent:
             used += size
         compacted = base + [message for unit in reversed(kept) for message in unit]
         self.on_event(
-            f"[context] raw={raw_size} chars compacted={len(json.dumps(compacted, ensure_ascii=False))} chars"
+            f"[context] raw={raw_size} chars reasoning_compacted={candidate_size} chars "
+            f"compacted={len(json.dumps(compacted, ensure_ascii=False))} chars"
         )
         return compacted
 
