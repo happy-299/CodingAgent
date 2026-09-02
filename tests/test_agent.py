@@ -709,9 +709,12 @@ class TerminalUITest(unittest.TestCase):
             ui.prompt()
         frame = stream.getvalue().rsplit("\033[H", 1)[-1]
         self.assertIn("MODEL deepseek-v4-flash", frame)
+        self.assertNotIn("MODEL  deepseek-v4-flash", frame)
+        self.assertNotIn("newest output stays visible", frame)
         self.assertIn("THINKING · COLLAPSED", frame)
         self.assertNotIn("private reasoning should stay collapsed", frame)
         self.assertIn("❯", frame)
+        self.assertIn("\033[20;6H\033[?25h", frame)
         self.assertEqual(stream.getvalue().count("\033[2K"), 20 * 5)
 
     def test_tty_reasoning_expands_inside_bounded_scrolling_pane(self):

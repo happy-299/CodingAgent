@@ -700,11 +700,9 @@ class TerminalUI:
         thinking_height = 1 if not self._thinking_expanded else min(7, max(3, rows // 4))
         header = [
             self._border(width, "╭", "╮"),
-            self._frame_line("CODING AGENT  ·  terminal-first autonomous development", width, self.CYAN),
-            self._frame_line(
-                f"MODEL  {self._model}   ·   WORKSPACE  {self._workspace}", width, self.DIM
-            ),
-            self._frame_line("ACTIVITY  ·  newest output stays visible", width, self.BLUE),
+            self._frame_line("CODING AGENT", width, self.CYAN),
+            self._frame_line(f"WORKSPACE  {self._workspace}", width, self.DIM),
+            self._frame_line("ACTIVITY", width, self.BLUE),
         ]
         footer = [
             self._border(width, "├", "┤"),
@@ -715,7 +713,7 @@ class TerminalUI:
             ),
         ]
         prompt_text = "❯ " if input_active else f"◌ {self._status} …"
-        footer.append("╰─ " + self._fit(prompt_text, max(1, width - 4)) + " │")
+        footer.append("╰─ " + self._fit(prompt_text, max(1, width - 5)) + " │")
 
         body_height = max(2, rows - len(header) - thinking_height - len(footer))
         activity = self._history_lines()
@@ -749,7 +747,13 @@ class TerminalUI:
         rendered = "\033[H\033[2J"
         rendered += "".join("\033[2K" + line + "\n" for line in frame[:-1])
         rendered += "\033[2K" + frame[-1]
-        rendered += "\033[?25h" if input_active else "\033[?25l"
+        if input_active:
+            # The prompt line is padded to the frame width, so explicitly put
+            # the real input cursor immediately after the left-side arrow.
+            cursor_column = len("╰─ " + prompt_text) + 1
+            rendered += f"\033[{rows};{cursor_column}H\033[?25h"
+        else:
+            rendered += "\033[?25l"
         self.stream.write(rendered)
         self.stream.flush()
 
@@ -766,9 +770,8 @@ class TerminalUI:
             self._write(f"Coding Agent | model={model} | workspace={workspace}")
             return
         self._write(self._paint(self.BANNER, self.BOLD, self.CYAN))
-        self._write(self._paint("  CODING AGENT  ·  terminal-first autonomous development", self.BOLD, self.PURPLE))
+        self._write(self._paint("  CODING AGENT", self.BOLD, self.PURPLE))
         self._write(self._paint(self._rule(), self.DIM))
-        self._write(f"  {self._paint('MODEL', self.PURPLE, self.BOLD)}      {model}")
         self._write(f"  {self._paint('WORKSPACE', self.BLUE, self.BOLD)}  {workspace}")
         self._write(self._paint(self._rule(), self.DIM))
         self._write(self._paint("  /thinking toggle reasoning   /clear reset conversation   /exit quit", self.DIM))
