@@ -440,7 +440,7 @@ class ConfigTest(unittest.TestCase):
         with patch.dict(os.environ, {"OPENAI_API_KEY": "test"}, clear=True):
             loaded = Config.from_env()
         self.assertEqual(loaded.reasoning_effort, "medium")
-        self.assertEqual(loaded.max_rounds, 60)
+        self.assertEqual(loaded.max_rounds, 80)
         self.assertEqual(loaded.max_history_chars, 160_000)
 
 
