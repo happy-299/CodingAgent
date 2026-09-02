@@ -1151,9 +1151,14 @@ def main() -> int:
     if not workspace.is_dir():
         print(f"error: workspace is not a directory: {workspace}", file=sys.stderr)
         return 1
+    # The agent is often launched from a separate task workspace. Keep the
+    # repository's .env discoverable without requiring callers to export keys.
+    project_directory = Path(__file__).resolve().parent
     load_dotenv(launch_directory / ".env")
     if workspace != launch_directory:
         load_dotenv(workspace / ".env")
+    if project_directory not in {launch_directory, workspace}:
+        load_dotenv(project_directory / ".env")
     try:
         config = Config.from_env()
         ui = TerminalUI(plain=args.plain)
