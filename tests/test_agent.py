@@ -803,6 +803,55 @@ class TerminalUITest(unittest.TestCase):
         self.assertIn("❯", restored)
         self.assertEqual(len(ui._last_frame), 20)
 
+    def test_tty_plan_stays_pinned_while_activity_scrolls(self):
+        stream = FakeTTY()
+        with patch("coding_agent.shutil.get_terminal_size", return_value=os.terminal_size((90, 20))):
+            ui = TerminalUI(stream=stream)
+            ui.banner("test-model", Path("/workspace"))
+            ui.event("[plan]\n" + json.dumps([
+                {"step": "requirements", "status": "completed"},
+                {"step": "inspect", "status": "completed"},
+                {"step": "design", "status": "completed"},
+                {"step": "scaffold", "status": "completed"},
+                {"step": "preflight", "status": "completed"},
+                {"step": "implement", "status": "in_progress"},
+                {"step": "verify", "status": "pending"},
+                {"step": "document", "status": "pending"},
+            ]))
+            for index in range(8):
+                event_id = f"{index + 1}.1"
+                ui.event(f"[tool {event_id}] terminal")
+                ui.event(f"[command {event_id}]\necho output-{index}")
+                ui.event(f"[result {event_id}] exit=0 output=10 bytes")
+                ui.event(f"[output {event_id}]\noutput-{index}")
+            newest = tty_frame(ui)
+            ui.scroll(100)
+            oldest = tty_frame(ui)
+        for frame in (newest, oldest):
+            self.assertIn("┌─ PLAN", frame)
+            self.assertIn("● implement", frame)
+            self.assertIn("5 hidden · 5/8 complete", frame)
+            self.assertEqual(frame.count("┌─ PLAN"), 1)
+        self.assertIn("output-7", newest)
+        self.assertNotIn("output-0", newest)
+        self.assertIn("output-0", oldest)
+        self.assertNotIn("output-7", oldest)
+
+    def test_tty_clear_removes_pinned_plan_and_activity(self):
+        stream = FakeTTY()
+        with patch("coding_agent.shutil.get_terminal_size", return_value=os.terminal_size((90, 20))):
+            ui = TerminalUI(stream=stream)
+            ui.banner("test-model", Path("/workspace"))
+            ui.event("[plan]\n" + json.dumps([
+                {"step": "implement", "status": "in_progress"},
+                {"step": "verify", "status": "pending"},
+            ]))
+            ui.event("[tool 1.1] terminal")
+            ui.clear_activity()
+        frame = tty_frame(ui)
+        self.assertNotIn("PLAN", frame)
+        self.assertNotIn("TOOL 1.1", frame)
+
     def test_tty_preserves_thinking_output_sequence_across_model_rounds(self):
         stream = FakeTTY()
         with patch("coding_agent.shutil.get_terminal_size", return_value=os.terminal_size((100, 30))):
@@ -857,6 +906,46 @@ class TerminalUITest(unittest.TestCase):
         self.assertEqual(update.count("\033[2K"), 2)
         self.assertIn("\033[19;1H", update)
         self.assertIn("\033[20;1H", update)
+
+    def test_tty_uses_semantic_colors_for_activity_cards(self):
+        stream = FakeTTY()
+        with patch("coding_agent.shutil.get_terminal_size", return_value=os.terminal_size((120, 40))):
+            ui = TerminalUI(stream=stream)
+            ui.color = True
+            ui.banner("test-model", Path("/workspace"))
+            ui.toggle_thinking()
+            ui.event("[model]")
+            ui.stream_delta("reasoning", "quiet reasoning")
+
+            def visible_row(token):
+                return next(row for row in ui._last_frame if token in ui._clean(row))
+
+            self.assertIn(ui.PURPLE, visible_row("THINKING"))
+            thinking_text = visible_row("quiet reasoning")
+            self.assertIn(ui.MUTED, thinking_text)
+            self.assertIn(ui.DIM, thinking_text)
+
+            ui.stream_delta("content", "## Summary\n\nWork completed")
+            ui.event("[plan]\n" + json.dumps([
+                {"step": "finished", "status": "completed"},
+                {"step": "active", "status": "in_progress"},
+                {"step": "later", "status": "pending"},
+                {"step": "blocked item", "status": "blocked"},
+            ]))
+            ui.event("[tool 1.1] terminal")
+            ui.event("[command 1.1]\npython3 -m unittest")
+            ui.event("[result 1.1] exit=0 output=3 bytes")
+            ui.event("[output 1.1]\nOK")
+
+            self.assertIn(ui.BLUE, visible_row("PLAN"))
+            self.assertIn(ui.GREEN, visible_row("finished"))
+            self.assertIn(ui.CYAN, visible_row("active"))
+            self.assertIn(ui.MUTED, visible_row("later"))
+            self.assertIn(ui.RED, visible_row("blocked item"))
+            self.assertIn(ui.YELLOW, visible_row("TOOL 1.1"))
+            self.assertIn(ui.CYAN, visible_row("$ python3"))
+            self.assertIn(ui.GREEN, visible_row("exit=0"))
+            self.assertIn(ui.MUTED, visible_row("OK"))
 
 
 if __name__ == "__main__":

@@ -556,10 +556,13 @@ class TerminalUI:
     CYAN = "\033[38;5;45m"
     BLUE = "\033[38;5;75m"
     PURPLE = "\033[38;5;141m"
+    TEXT = "\033[38;5;252m"
+    MUTED = "\033[38;5;245m"
     GREEN = "\033[38;5;78m"
     YELLOW = "\033[38;5;221m"
     RED = "\033[38;5;203m"
     THINKING_WINDOW_LINES = 6
+    PLAN_WINDOW_LINES = 10
 
     BANNER = (
         " ██████╗ ██████╗ ██████╗ ██╗███╗   ██╗ ██████╗      █████╗  ██████╗ ███████╗███╗   ██╗████████╗\n"
@@ -660,9 +663,10 @@ class TerminalUI:
                 used += ellipsis_width
         return "".join(output) + " " * max(0, width - used)
 
-    def _frame_line(self, text: str, width: int, color: str = "") -> str:
+    def _frame_line(self, text: str, width: int, *styles: str) -> str:
         inner = self._fit(self._clean(text), max(1, width - 4))
-        return self._paint("│ " + inner + " │", color) if color else "│ " + inner + " │"
+        line = "│ " + inner + " │"
+        return self._paint(line, *styles) if styles else line
 
     @staticmethod
     def _border(width: int, left: str, right: str) -> str:
@@ -761,74 +765,139 @@ class TerminalUI:
             return "✗", self.RED
         return "·", self.YELLOW
 
-    def _history_lines(self, content_width: int | None = None) -> list[str]:
-        lines: list[str] = []
+    def _agent_styles(self, line: str) -> tuple[str, ...]:
+        if line.startswith("▌ "):
+            return self.CYAN, self.BOLD
+        if line.startswith(("┌─ code", "└─ code")):
+            return (self.BLUE,)
+        if line.startswith("│ "):
+            return (self.MUTED,)
+        return (self.TEXT,)
+
+    def _plan_rows(self, max_lines: int) -> list[tuple[str, tuple[str, ...]]]:
+        if self._plan_entry is None or max_lines < 2:
+            return []
+        items = list(self._plan_entry.get("items", []))
+        if not items:
+            return []
+        icons = {"completed": "✓", "in_progress": "●", "pending": "○", "blocked": "!"}
+        colors = {
+            "completed": (self.GREEN,),
+            "in_progress": (self.CYAN, self.BOLD),
+            "pending": (self.MUTED,),
+            "blocked": (self.RED, self.BOLD),
+        }
+
+        def item_row(item: dict[str, Any]) -> tuple[str, tuple[str, ...]]:
+            status = item.get("status", "pending")
+            text = f"│ {icons.get(status, '○')} {item.get('step', '')}"
+            return text, colors.get(status, (self.MUTED,))
+
+        rows: list[tuple[str, tuple[str, ...]]] = [("┌─ PLAN", (self.BLUE, self.BOLD))]
+        if len(items) + 2 <= max_lines:
+            rows.extend(item_row(item) for item in items)
+        elif max_lines >= 4:
+            visible_count = max_lines - 3
+            focus = next(
+                (index for index, item in enumerate(items) if item.get("status") == "in_progress"),
+                next((index for index, item in enumerate(items) if item.get("status") != "completed"), len(items) - 1),
+            )
+            start = max(0, min(focus - visible_count // 2, len(items) - visible_count))
+            selected = items[start : start + visible_count]
+            rows.extend(item_row(item) for item in selected)
+            hidden = len(items) - len(selected)
+            completed = sum(item.get("status") == "completed" for item in items)
+            rows.append((f"│ … {hidden} hidden · {completed}/{len(items)} complete", (self.MUTED,)))
+        else:
+            completed = sum(item.get("status") == "completed" for item in items)
+            rows.append((f"│ {completed}/{len(items)} complete", (self.MUTED,)))
+        rows.append(("└─", (self.BLUE,)))
+        return rows[:max_lines]
+
+    def _pinned_plan_rows(self, terminal_rows: int) -> list[tuple[str, tuple[str, ...]]]:
+        available = max(0, terminal_rows - 4 - 3 - 3)
+        max_lines = min(self.PLAN_WINDOW_LINES, max(3, terminal_rows // 3), available)
+        return self._plan_rows(max_lines)
+
+    def _history_rows(self, content_width: int | None = None) -> list[tuple[str, tuple[str, ...]]]:
+        rows: list[tuple[str, tuple[str, ...]]] = []
+
+        def add(text: str, *styles: str) -> None:
+            rows.append((text, styles))
+
         for entry in self._entries:
             kind = entry.get("kind")
             if kind == "tool":
-                icon, _ = self._tool_state(entry)
+                icon, state_color = self._tool_state(entry)
                 event_id = entry.get("id", "?")
                 name = entry.get("name", "tool")
-                lines.append(f"┌─ TOOL {event_id} · {name}  {icon}")
+                add(f"┌─ TOOL {event_id} · {name}  {icon}", self.YELLOW, self.BOLD)
                 command = str(entry.get("command", ""))
                 if command:
                     command_lines = self._clean(command).splitlines()
                     for command_line in command_lines[:8]:
-                        lines.append(f"│ $ {command_line}")
+                        add(f"│ $ {command_line}", self.CYAN)
                     if len(command_lines) > 8:
-                        lines.append(f"│ … {len(command_lines) - 8} more command lines")
+                        add(f"│ … {len(command_lines) - 8} more command lines", self.MUTED)
                 status = str(entry.get("status", ""))
                 if status:
-                    lines.append(f"│ ↳ {status}")
+                    add(f"│ ↳ {status}", state_color)
                 output = self._clean(str(entry.get("output", "")))
                 if output:
                     output_lines = output.rstrip().splitlines()
                     if len(output_lines) > 24:
-                        lines.append(f"│ … {len(output_lines) - 24} earlier output lines")
+                        add(f"│ … {len(output_lines) - 24} earlier output lines", self.MUTED)
                         output_lines = output_lines[-24:]
-                    lines.extend(f"│   {line}" for line in output_lines)
-                lines.append("└─")
+                    for line in output_lines:
+                        add(f"│   {line}", self.MUTED)
+                add("└─", self.YELLOW)
             elif kind == "plan":
-                lines.append("┌─ PLAN")
-                icons = {"completed": "✓", "in_progress": "●", "pending": "○", "blocked": "!"}
-                for item in entry.get("items", []):
-                    status = item.get("status", "pending")
-                    lines.append(f"│ {icons.get(status, '○')} {item.get('step', '')}")
-                lines.append("└─")
+                continue
             elif kind == "agent":
-                lines.append("┌─ AGENT")
-                lines.extend(f"│ {line}" for line in self._markdown_lines(str(entry.get("body", ""))))
-                lines.append("└─")
+                add("┌─ AGENT", self.GREEN, self.BOLD)
+                for line in self._markdown_lines(str(entry.get("body", ""))):
+                    add(f"│ {line}", *self._agent_styles(line))
+                add("└─", self.GREEN)
             elif kind == "thinking":
                 body = str(entry.get("body", ""))
                 active = bool(entry.get("active"))
                 if entry.get("expanded"):
-                    lines.append("┌─ THINKING · " + ("LIVE" if active else "COMPLETE"))
+                    add("┌─ THINKING · " + ("LIVE" if active else "COMPLETE"), self.PURPLE)
                     reasoning_lines = self._markdown_lines(body)
                     if content_width is not None:
                         reasoning_lines = self._wrap_display_lines(reasoning_lines, content_width - 2)
                     visible = reasoning_lines[-(self.THINKING_WINDOW_LINES - 2) :]
-                    lines.extend(f"│ {line}" for line in visible)
-                    lines.extend("│ " for _ in range(self.THINKING_WINDOW_LINES - 2 - len(visible)))
-                    lines.append("└─")
+                    for line in visible:
+                        add(f"│ {line}", self.MUTED, self.DIM)
+                    for _ in range(self.THINKING_WINDOW_LINES - 2 - len(visible)):
+                        add("│ ", self.MUTED, self.DIM)
+                    add("└─", self.PURPLE)
                 else:
                     label = "LIVE · COLLAPSED" if active else "COMPLETE · COLLAPSED"
-                    lines.append(f"┌─ THINKING · {label} · {len(body)} chars")
-                    lines.append("└─")
+                    add(f"┌─ THINKING · {label} · {len(body)} chars", self.PURPLE)
+                    add("└─", self.PURPLE)
             elif kind == "error":
-                lines.append(f"✗ ERROR  {self._clean(str(entry.get('body', '')))}")
+                add(f"✗ ERROR  {self._clean(str(entry.get('body', '')))}", self.RED, self.BOLD)
             else:
                 title = self._clean(str(entry.get("title", "")))
                 body = self._clean(str(entry.get("body", "")))
-                lines.append(f"• {title}{(': ' + body) if body else ''}")
+                styles = (self.GREEN, self.BOLD) if title == "DONE" else (self.BLUE,)
+                add(f"• {title}{(': ' + body) if body else ''}", *styles)
 
         if self._model_phase == "content" and self._live_content:
-            lines.append("┌─ AGENT · LIVE")
-            lines.extend(f"│ {line}" for line in self._markdown_lines(self._live_content))
-            lines.append("└─")
+            add("┌─ AGENT · LIVE", self.GREEN, self.BOLD)
+            for line in self._markdown_lines(self._live_content):
+                add(f"│ {line}", *self._agent_styles(line))
+            add("└─", self.GREEN)
         if content_width is not None:
-            return self._wrap_display_lines(lines, content_width)
-        return lines
+            wrapped: list[tuple[str, tuple[str, ...]]] = []
+            for text, styles in rows:
+                wrapped.extend((part, styles) for part in self._wrap_display_line(text, content_width))
+            return wrapped
+        return rows
+
+    def _history_lines(self, content_width: int | None = None) -> list[str]:
+        return [text for text, _ in self._history_rows(content_width)]
 
     def _render_tty(self, input_active: bool = False, input_text: str | None = None) -> None:
         with self._ui_lock:
@@ -858,8 +927,10 @@ class TerminalUI:
         prompt_text = ("❯ " + self._input_text) if input_active else f"◌ {self._status} …"
         footer.append("╰─ " + self._fit(prompt_text, max(1, width - 5)) + " │")
 
-        body_height = max(2, rows - len(header) - len(footer))
-        activity = self._history_lines(width - 4)
+        plan_rows = self._pinned_plan_rows(rows)
+        pinned_plan = [self._frame_line(line, width, *styles) for line, styles in plan_rows]
+        body_height = max(2, rows - len(header) - len(pinned_plan) - len(footer))
+        activity = self._history_rows(width - 4)
         if self._scroll_offset:
             maximum = max(0, len(activity) - body_height)
             self._scroll_offset = min(self._scroll_offset, maximum)
@@ -867,9 +938,9 @@ class TerminalUI:
             activity = activity[max(0, end - body_height) : end]
         else:
             activity = activity[-body_height:]
-        body = [self._frame_line(line, width) for line in activity]
+        body = [self._frame_line(line, width, *styles) for line, styles in activity]
         body.extend(self._frame_line("", width) for _ in range(body_height - len(body)))
-        frame = (header + body + footer)[:rows]
+        frame = (header + pinned_plan + body + footer)[:rows]
         frame.extend("" for _ in range(rows - len(frame)))
 
         # Raw input mode disables the terminal's usual LF -> CRLF conversion.
@@ -903,7 +974,7 @@ class TerminalUI:
         if not self.interactive or not delta:
             return
         _, rows = self._terminal_size()
-        body_height = max(2, rows - 4 - 3)
+        body_height = max(2, rows - 4 - len(self._pinned_plan_rows(rows)) - 3)
         width, _ = self._terminal_size()
         maximum = max(0, len(self._history_lines(width - 4)) - body_height)
         self._scroll_offset = max(0, min(maximum, self._scroll_offset + delta))
@@ -988,6 +1059,11 @@ class TerminalUI:
         """Listen for mouse-wheel navigation while the model is working."""
         if not self.interactive or self._mouse_thread is not None:
             return
+        # A plan belongs to one task.  Keep a completed plan visible until the
+        # next task starts, then release the pinned area unless a new plan is
+        # created during that task.
+        self._entries = [entry for entry in self._entries if entry.get("kind") != "plan"]
+        self._plan_entry = None
         self._scroll_offset = 0
         self._mouse_stop = threading.Event()
         self._mouse_thread = threading.Thread(target=self._mouse_loop, daemon=True)
@@ -1000,6 +1076,21 @@ class TerminalUI:
             self._mouse_thread.join(timeout=0.5)
         self._mouse_stop = None
         self._mouse_thread = None
+
+    def clear_activity(self) -> None:
+        """Reset the dashboard alongside the agent's conversation state."""
+        with self._ui_lock:
+            self._entries.clear()
+            self._tool_entries.clear()
+            self._plan_entry = None
+            self._thinking_entry = None
+            self._reasoning_text = ""
+            self._streamed_content = ""
+            self._live_content = ""
+            self._model_phase = "idle"
+            self._scroll_offset = 0
+            self._status = "ready"
+            self._render_tty_unlocked(input_active=self._input_active)
 
     def read_prompt(self) -> str:
         """Read a prompt without surrendering mouse-wheel navigation to the shell."""
@@ -1815,6 +1906,7 @@ def main() -> int:
             if text == "/clear":
                 agent.messages = [dict(agent.system_message)]
                 agent.plan.reset()
+                ui.clear_activity()
                 ui.event("Conversation cleared.")
                 continue
             try:
