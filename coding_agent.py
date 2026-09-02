@@ -9,6 +9,7 @@ import json
 import os
 import re
 import signal
+import shlex
 import shutil
 import subprocess
 import sys
@@ -111,13 +112,54 @@ def _clip(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
 def _looks_like_verification_command(command: str) -> bool:
     """Recognize common test/verification commands without naming a project."""
     normalized = command.lower()
-    return bool(re.search(
-        r"(?:pytest|unittest|go\s+test|cargo\s+test|npm\s+(?:run\s+)?test|"
-        r"mvn\s+test|gradle\s+test|dotnet\s+test|make\s+test|--self-?test\b|"
-        r"py_compile|compileall|cargo\s+check|npm\s+(?:run\s+)?build|"
-        r"ruff\s+check|flake8|mypy|eslint|(?:^|\s)tsc(?:\s|$))",
-        normalized,
-    ))
+    # A capability probe such as ``which pytest`` is not a project check. Split
+    # common shell lists so a real check later in ``which pytest && pytest -q``
+    # still counts while a probe-only orientation command does not.
+    clauses = re.split(r"(?:&&|\|\||[;|])", normalized)
+    for clause in clauses:
+        clause = clause.strip().lstrip("(").strip()
+        if not clause:
+            continue
+        try:
+            tokens = shlex.split(clause)
+        except ValueError:
+            # A malformed command should not be treated as proof of success.
+            continue
+        while tokens and re.fullmatch(r"[a-z_][a-z0-9_]*=.+", tokens[0]):
+            tokens.pop(0)
+        if not tokens:
+            continue
+        executable = Path(tokens[0]).name
+        args = tokens[1:]
+        if executable in {"which", "command", "type", "where", "where.exe", "hash"}:
+            continue
+        if executable in {"pytest", "py.test", "jest", "vitest"}:
+            if "--version" not in args:
+                return True
+            continue
+        if executable.startswith("python"):
+            if "--selftest" in args or "--self-test" in args:
+                return True
+            if "-m" in args:
+                module_index = args.index("-m")
+                if module_index + 1 < len(args) and args[module_index + 1] in {
+                    "unittest", "pytest", "py_compile", "compileall"
+                }:
+                    return True
+            continue
+        if executable in {"go", "cargo", "mvn", "gradle", "dotnet", "make"}:
+            if "test" in args or (executable == "cargo" and "check" in args):
+                return True
+            continue
+        if executable == "npm":
+            if args[:1] == ["test"] or args[:2] in (["run", "test"], ["run", "build"]):
+                return True
+            continue
+        if executable in {"ruff", "flake8", "mypy", "eslint", "tsc"}:
+            if executable == "ruff" and args[:1] != ["check"]:
+                continue
+            return True
+    return False
 
 
 def _contains_tool_markup(content: str) -> bool:
@@ -810,6 +852,7 @@ class CodingAgent:
         planning_nudge_sent = False
         terminal_calls_since_plan_update = 0
         tool_free_final_retries = 0
+        textual_tool_retries = 0
 
         def completion_audit_prompt() -> str:
             evidence_note = (
@@ -891,6 +934,25 @@ class CodingAgent:
                     raise AgentError(f"Model stopped without completing the task: {finish}.")
                 if not isinstance(message.get("content"), str) or not message["content"].strip():
                     raise AgentError("Model stopped without returning final text.")
+                if (
+                    not tool_free_final
+                    and _contains_tool_markup(message["content"])
+                    and textual_tool_retries < 2
+                ):
+                    textual_tool_retries += 1
+                    self.on_event(
+                        "[tool protocol] provider returned textual tool markup; requesting a native tool call"
+                    )
+                    self.messages.append({
+                        "role": "user",
+                        "content": (
+                            "The previous response contained provider-specific textual tool markup; it was not executed. "
+                            "Continue the same task from the actual workspace state. Use the provided native terminal "
+                            "or update_plan tools for any action, and do not emit XML, DSML, or other textual tool-call "
+                            "markup. Inspect the workspace as needed and continue toward verified completion."
+                        ),
+                    })
+                    continue
                 if (
                     (verification_final or audit_tool_budget_exhausted)
                     and _contains_tool_markup(message["content"])

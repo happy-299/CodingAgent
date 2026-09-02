@@ -208,6 +208,30 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(result, "Verified.")
         self.assertEqual(len(client.requests), 3)
 
+    def test_textual_tool_markup_is_retried_with_native_tools(self):
+        first = {
+            "id": "first",
+            "type": "function",
+            "function": {"name": "terminal", "arguments": '{"command":"printf ready"}'},
+        }
+        second = {
+            "id": "second",
+            "type": "function",
+            "function": {"name": "terminal", "arguments": '{"command":"touch completed.txt"}'},
+        }
+        client = ScriptedClient([
+            {"choices": [{"finish_reason": "tool_calls", "message": {"role": "assistant", "content": None, "tool_calls": [first]}}]},
+            {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "<｜｜DSML｜｜tool_calls>not executed</｜｜DSML｜｜tool_calls>"}}]},
+            {"choices": [{"finish_reason": "tool_calls", "message": {"role": "assistant", "content": None, "tool_calls": [second]}}]},
+            {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "Finished."}}]},
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            result = CodingAgent(client, Path(directory), config(), on_event=lambda _: None).run("finish the task")
+            self.assertTrue(Path(directory, "completed.txt").exists())
+        self.assertEqual(result, "Finished.")
+        self.assertEqual(client.tool_choices[1], "auto")
+
+
     def test_completed_plan_starts_audit_and_reuses_verification_evidence(self):
         planning = {
             "id": "plan-start",
@@ -517,6 +541,11 @@ class ArchitectureTest(unittest.TestCase):
         ]
         self.assertTrue(all(_looks_like_verification_command(command) for command in commands))
         self.assertFalse(_looks_like_verification_command("ls -la"))
+        self.assertFalse(_looks_like_verification_command(
+            "python3 --version; which python3; which pytest 2>/dev/null || echo no pytest"
+        ))
+        self.assertFalse(_looks_like_verification_command("pytest --version"))
+        self.assertTrue(_looks_like_verification_command("which pytest && pytest -q"))
 
     def test_system_prompt_contains_no_named_evaluation_scenarios(self):
         for task_name in ("MiniQueue", "2048", "HTTP"):
