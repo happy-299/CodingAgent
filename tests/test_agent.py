@@ -669,6 +669,10 @@ class FakeTTY(io.StringIO):
         return True
 
 
+def tty_frame(ui: TerminalUI) -> str:
+    return "\n".join(ui._clean(line) for line in ui._last_frame)
+
+
 class TerminalUITest(unittest.TestCase):
     def test_plain_render_contains_all_demo_sections_without_ansi(self):
         stream = io.StringIO()
@@ -707,7 +711,7 @@ class TerminalUITest(unittest.TestCase):
             ui.stream_delta("reasoning", "private reasoning should stay collapsed")
             ui.stream_delta("content", "working")
             ui.prompt()
-        frame = stream.getvalue().rsplit("\033[H", 1)[-1]
+        frame = tty_frame(ui)
         self.assertIn("MODEL deepseek-v4-flash", frame)
         self.assertNotIn("MODEL  deepseek-v4-flash", frame)
         self.assertNotIn("newest output stays visible", frame)
@@ -715,8 +719,8 @@ class TerminalUITest(unittest.TestCase):
         self.assertNotIn("private reasoning should stay collapsed", frame)
         self.assertLess(frame.index("THINKING · COMPLETE"), frame.index("AGENT · LIVE"))
         self.assertIn("❯", frame)
-        self.assertIn("\033[20;6H\033[?25h", frame)
-        self.assertEqual(stream.getvalue().count("\033[2K"), 20 * 5)
+        self.assertIn("\033[20;6H\033[?25h", stream.getvalue())
+        self.assertEqual(len(ui._last_frame), 20)
 
     def test_tty_reasoning_expands_inside_bounded_scrolling_pane(self):
         stream = FakeTTY()
@@ -726,11 +730,11 @@ class TerminalUITest(unittest.TestCase):
             ui.event("[model]")
             ui.stream_delta("reasoning", "\n".join(f"reasoning-{i}" for i in range(10)))
             self.assertTrue(ui.toggle_thinking())
-        frame = stream.getvalue().rsplit("\033[H", 1)[-1]
+        frame = tty_frame(ui)
         self.assertIn("THINKING · LIVE", frame)
         self.assertIn("reasoning-9", frame)
         self.assertNotIn("reasoning-0", frame)
-        self.assertEqual(frame.count("\033[2K"), 20)
+        self.assertEqual(len(ui._last_frame), 20)
 
     def test_completed_thinking_card_expands_on_first_toggle(self):
         stream = FakeTTY()
@@ -742,7 +746,7 @@ class TerminalUITest(unittest.TestCase):
             ui.stream_delta("reasoning", "completed reasoning")
             ui.stream_delta("content", "formal output")
             self.assertTrue(ui.toggle_thinking())
-        frame = stream.getvalue().rsplit("\033[H", 1)[-1]
+        frame = tty_frame(ui)
         self.assertIn("THINKING · COMPLETE", frame)
         self.assertIn("completed reasoning", frame)
 
@@ -755,7 +759,7 @@ class TerminalUITest(unittest.TestCase):
             ui.event("[command 2.1]\npython3 -m unittest")
             ui.event("[result 2.1] exit=0 output=3 bytes")
             ui.event("[output 2.1]\nOK")
-        frame = stream.getvalue().rsplit("\033[H", 1)[-1]
+        frame = tty_frame(ui)
         self.assertIn("TOOL 2.1 · terminal", frame)
         self.assertIn("$ python3 -m unittest", frame)
         self.assertIn("↳ exit=0 output=3 bytes", frame)
@@ -769,7 +773,7 @@ class TerminalUITest(unittest.TestCase):
             ui = TerminalUI(stream=stream)
             ui.banner("test-model", Path("/workspace"))
             ui.event("[planning checkpoint] deciding whether a plan is useful")
-        frame = stream.getvalue().rsplit("\033[H", 1)[-1]
+        frame = tty_frame(ui)
         self.assertIn("planning checkpoint: deciding whether a plan is useful", frame)
         self.assertNotIn("checkpoint]", frame)
 
@@ -785,11 +789,11 @@ class TerminalUITest(unittest.TestCase):
                 ui.event(f"[result {event_id}] exit=0 output=10 bytes")
                 ui.event(f"[output {event_id}]\noutput-{index}")
             ui.prompt()
-            newest = stream.getvalue().rsplit("\033[H", 1)[-1]
+            newest = tty_frame(ui)
             ui.scroll(100)
-            oldest = stream.getvalue().rsplit("\033[H", 1)[-1]
+            oldest = tty_frame(ui)
             ui.scroll(-100)
-            restored = stream.getvalue().rsplit("\033[H", 1)[-1]
+            restored = tty_frame(ui)
         self.assertIn("output-9", newest)
         self.assertNotIn("output-0", newest)
         self.assertIn("output-0", oldest)
@@ -797,7 +801,7 @@ class TerminalUITest(unittest.TestCase):
         self.assertIn("output-9", restored)
         self.assertIn("MODEL test-model", restored)
         self.assertIn("❯", restored)
-        self.assertEqual(restored.count("\033[2K"), 20)
+        self.assertEqual(len(ui._last_frame), 20)
 
     def test_tty_preserves_thinking_output_sequence_across_model_rounds(self):
         stream = FakeTTY()
@@ -810,7 +814,7 @@ class TerminalUITest(unittest.TestCase):
             ui.event("[model]")
             ui.stream_delta("reasoning", "second reasoning")
             ui.stream_delta("content", "Second formal output")
-        frame = stream.getvalue().rsplit("\033[H", 1)[-1]
+        frame = tty_frame(ui)
         first_thinking = frame.index("THINKING · COMPLETE")
         first_output = frame.index("First formal output")
         second_thinking = frame.index("THINKING · COMPLETE", first_thinking + 1)
@@ -825,7 +829,7 @@ class TerminalUITest(unittest.TestCase):
             ui = TerminalUI(stream=stream)
             ui.banner("test-model", Path("/工作区/演示"))
             ui.answer("# 总结\n\n**结果**：创建了 `你好.txt`。\n\n- 第一项内容很长，需要正确换行而不能挤坏右侧边框")
-        frame = stream.getvalue().rsplit("\033[H", 1)[-1]
+        frame = tty_frame(ui)
         self.assertIn("▌ 总结", frame)
         self.assertIn("• 第一项", frame)
         self.assertNotIn("**结果**", frame)
@@ -838,6 +842,21 @@ class TerminalUITest(unittest.TestCase):
         self.assertEqual(TerminalUI._mouse_button(b"\x1b[<64;10;5M"), 64)
         self.assertEqual(TerminalUI._mouse_button(b"\x1b[<65;10;5M"), 65)
         self.assertIsNone(TerminalUI._mouse_button(b"\x1b[A"))
+
+    def test_tty_redraw_uses_absolute_rows_and_only_repaints_changes(self):
+        stream = FakeTTY()
+        with patch("coding_agent.shutil.get_terminal_size", return_value=os.terminal_size((80, 20))):
+            ui = TerminalUI(stream=stream)
+            ui.banner("test-model", Path("/workspace"))
+            initial_end = len(stream.getvalue())
+            ui._status = "working"
+            ui._render_tty()
+            update = stream.getvalue()[initial_end:]
+        self.assertNotIn("\n", stream.getvalue())
+        self.assertNotIn("\033[2J", update)
+        self.assertEqual(update.count("\033[2K"), 2)
+        self.assertIn("\033[19;1H", update)
+        self.assertIn("\033[20;1H", update)
 
 
 if __name__ == "__main__":

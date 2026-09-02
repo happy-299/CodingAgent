@@ -597,6 +597,8 @@ class TerminalUI:
         self._mouse_stop: threading.Event | None = None
         self._mouse_thread: threading.Thread | None = None
         self._screen_started = False
+        self._last_frame: list[str] = []
+        self._last_size: tuple[int, int] | None = None
 
     def _paint(self, text: str, *styles: str) -> str:
         return "".join(styles) + text + self.RESET if self.color else text
@@ -869,9 +871,23 @@ class TerminalUI:
         body.extend(self._frame_line("", width) for _ in range(body_height - len(body)))
         frame = (header + body + footer)[:rows]
         frame.extend("" for _ in range(rows - len(frame)))
-        rendered = "\033[H\033[2J"
-        rendered += "".join("\033[2K" + line + "\n" for line in frame[:-1])
-        rendered += "\033[2K" + frame[-1]
+
+        # Raw input mode disables the terminal's usual LF -> CRLF conversion.
+        # Address every changed row explicitly so rendering never depends on a
+        # newline returning the cursor to column one.  Keeping the prior frame
+        # also avoids clearing and repainting the whole screen for every SSE
+        # token, which is visibly distracting in real terminals.
+        size = (width, rows)
+        resized = self._last_size != size
+        previous = [] if resized else self._last_frame
+        rendered = "\033[?25l"
+        if resized:
+            rendered += "\033[2J"
+        for row, line in enumerate(frame, start=1):
+            if row > len(previous) or previous[row - 1] != line:
+                rendered += f"\033[{row};1H\033[2K{line}"
+        self._last_frame = list(frame)
+        self._last_size = size
         if input_active:
             # The prompt line is padded to the frame width, so explicitly put
             # the real input cursor immediately after the left-side arrow.
