@@ -45,7 +45,7 @@ GitHub：https://github.com/happy-299/CodingAgent
 | 模型输出解析 | 校验 tool 名称、JSON 参数、类型和异常，并按 `tool_call_id` 回传结构化结果 |
 | 规划与完成判断 | 模型先侦察再根据任务复杂度自主决定是否规划；计划停滞时重新对齐原始验收标准，计划完成后立即审计证据，计划项必须全部完成或明确阻塞 |
 | 流式交互 | 以 SSE 增量读取 reasoning/content/tool calls；命令事件和模型增量均实时渲染，工具调用仍在完整组装后执行 |
-| 循环终止 | 模型返回最终文本并通过完成审计时结束；输出达到 token 上限时保留上下文自动续写；达到轮数上限后禁用工具并给予一次诚实收尾机会 |
+| 循环终止 | 模型返回最终文本并通过完成审计时结束；输出达到 token 上限时保留上下文自动续写；默认 60 轮仅作为安全边界，达到上限后禁用工具并给予一次诚实收尾机会 |
 | 错误处理 | API 重试、配置校验、命令超时、进程组终止、非零退出码、长输出截断、未知工具错误回传 |
 
 终端子进程不会继承名称中含独立 Key、Token、Secret、Password、Credential 标识或常见凭据后缀的敏感环境变量，同时避免误伤普通单词中的相同字母片段。命令超时时会终止整个子进程组，避免遗留后台进程。它仍不是操作系统级沙箱，因此应在可信仓库中使用，并在提交前检查 diff。
@@ -84,7 +84,7 @@ OPENAI_BASE_URL=https://api.deepseek.com
 OPENAI_API_KEY=your-deepseek-api-key
 OPENAI_MODEL=deepseek-v4-flash
 AGENT_API_TIMEOUT=180
-AGENT_MAX_ROUNDS=30
+AGENT_MAX_ROUNDS=60
 AGENT_MAX_HISTORY_CHARS=160000
 AGENT_MAX_OUTPUT_TOKENS=32768
 AGENT_REASONING_EFFORT=medium

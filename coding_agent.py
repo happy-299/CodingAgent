@@ -74,7 +74,7 @@ class Config:
     base_url: str
     model: str
     timeout: int = 180
-    max_rounds: int = 30
+    max_rounds: int = 60
     max_history_chars: int = 160_000
     max_output_tokens: int = 32_768
     reasoning_effort: str = "medium"
@@ -95,7 +95,7 @@ class Config:
             base_url=os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com").rstrip("/"),
             model=os.getenv("OPENAI_MODEL", "deepseek-v4-flash"),
             timeout=_env_int("AGENT_API_TIMEOUT", 180, 1, 600),
-            max_rounds=_env_int("AGENT_MAX_ROUNDS", 30, 1, 100),
+            max_rounds=_env_int("AGENT_MAX_ROUNDS", 60, 1, 100),
             max_history_chars=_env_int("AGENT_MAX_HISTORY_CHARS", 160_000, 10_000, 10_000_000),
             max_output_tokens=_env_int("AGENT_MAX_OUTPUT_TOKENS", 32_768, 1_024, 384_000),
             reasoning_effort=reasoning_effort,
